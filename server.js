@@ -3,22 +3,23 @@ const axios = require('axios');
 const cors = require('cors');
 
 const app = express();
+
+// WICHTIG: CORS noch *vor* allen Routen aktivieren
+app.use(cors());
 app.use(express.json());
 
-// Wir lesen den API-Key aus einer Umgebungsvariable "OPENROUTER_API_KEY".
-// Auf Render stellen wir die später ein.
+// Openrouter API-Key aus Env-Var lesen (in Render.com hinterlegt)
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 
-// Wenn JanitorAI einen POST an /proxy schickt, kommen wir hier rein:
-app.post('/proxy', async (req, res) => {
+// Routen-Endpunkt --> /v1/chat/completions
+// Damit JanitorAI denkt, sie spricht mit "OpenAI-Style" Endpoint
+app.post('/v1/chat/completions', async (req, res) => {
   try {
-    // Body, den JanitorAI schickt
     const clientBody = req.body;
 
-    // Hier fügen wir die gewünschten "safety_settings" hinzu.
-    // Du kannst beliebig anpassen, z. B. einzelne categories weglassen.
+    // safety_settings hinzufügen
     const newBody = {
-      ...clientBody, // Übernimmt alle Felder, die JanitorAI schon geschickt hat
+      ...clientBody,
       safety_settings: [
         {
           category: 'HARM_CATEGORY_HARASSMENT',
@@ -39,19 +40,19 @@ app.post('/proxy', async (req, res) => {
       ],
     };
 
-    // Wir schicken den modifizierten Body an Openrouter
+    // An Openrouter schicken
     const response = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       newBody,
       {
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${OPENROUTER_API_KEY}`, // Auth mit unserem Key
+          'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
         },
       }
     );
 
-    // Anschließend schicken wir die Antwort 1:1 wieder zurück an JanitorAI
+    // Openrouter-Antwort zurück an den Client
     return res.json(response.data);
   } catch (error) {
     console.error(error);

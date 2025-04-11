@@ -1,23 +1,35 @@
+/*************************************************
+ * server.js - Beispiel mit Node/Express + Axios + CORS
+ *************************************************/
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 
+// Erzeuge eine Express-App
 const app = express();
 
-// WICHTIG: CORS noch *vor* allen Routen aktivieren
+// 1) CORS erlauben (wichtig für Browser-Anfragen)
 app.use(cors());
-app.use(express.json());
 
-// Openrouter API-Key aus Env-Var lesen (in Render.com hinterlegt)
+// 2) JSON mit erhöhtem Limit parsen, z. B. 5MB
+//    So verhinderst du den 413 "Payload Too Large" Fehler.
+app.use(express.json({ limit: '100mb' }));
+
+// Lies den Openrouter-API-Key aus der Umgebung.
+// Setze in Render -> Environment -> OPENROUTER_API_KEY
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 
-// Routen-Endpunkt --> /v1/chat/completions
-// Damit JanitorAI denkt, sie spricht mit "OpenAI-Style" Endpoint
+// Deine Proxy-Route. Hier simulieren wir z. B. OpenAI-Style /v1/chat/completions
 app.post('/v1/chat/completions', async (req, res) => {
   try {
+    // Log: sieh nach, was vom Client (z. B. Janitor) geschickt wird
+    console.log("== Neue Anfrage von Janitor? ==");
+    console.log("Request Body:", JSON.stringify(req.body));
+
+    // Body übernehmen, den Janitor schickt
     const clientBody = req.body;
 
-    // safety_settings hinzufügen
+    // Du fügst hier die safety_settings hinzu
     const newBody = {
       ...clientBody,
       safety_settings: [
@@ -40,10 +52,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       ],
     };
 
-    // An Openrouter schicken
+    // Leite es an Openrouter weiter:
     const response = await axios.post(
-      'https://openrouter.ai/api/v1/chat/completions',
-      newBody,
+      'https://openrouter.ai/api/v1/chat/completions', // Ziel
+      newBody,                                        // Body
       {
         headers: {
           'Content-Type': 'application/json',
@@ -52,17 +64,20 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     );
 
-    // Openrouter-Antwort zurück an den Client
+    // Antwort von Openrouter an den Client zurückgeben
+    console.log("== Openrouter-Antwort ==", response.data);
     return res.json(response.data);
+
   } catch (error) {
-    console.error(error);
+    // Fehlerbehandlung
+    console.error("Error in Proxy:", error.response?.data || error.message);
     return res.status(500).json({
       error: error.toString() || 'Fehler beim Proxy-Request',
     });
   }
 });
 
-// Server starten
+// Starte den Express-Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Proxy läuft auf Port ${PORT}`);

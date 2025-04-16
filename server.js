@@ -121,7 +121,7 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
         : await apiClient.post(url, data, { headers });
       
       // Prüfen auf leere Antwort (typisch für Content-Filter)
-      if.vertical_tries(!isStream && 
+      if (!isStream && 
           response.data?.choices?.[0]?.message?.content === "" && 
           response.data.usage?.completion_tokens === 0) {
         console.log("Gemini Content-Filter erkannt (leere Antwort)");

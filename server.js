@@ -574,17 +574,17 @@ app.post('/cash', async (req, res) => {
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25");
 });
 
-// NEUE ROUTE: "/freejb" - Freies Modell mit Jailbreak
-app.post('/freejb', async (req, res) => {
+// NEUE ROUTE: "/jbfree" - Freies Modell mit Jailbreak
+app.post('/jbfree', async (req, res) => {
   const requestTimestamp = new Date().toISOString();
-  console.log(`== Neue Anfrage über /freejb mit Jailbreak (${requestTimestamp}) ==`);
+  console.log(`== Neue Anfrage über /jbfree mit Jailbreak (${requestTimestamp}) ==`);
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-exp-03-25:free", true);
 });
 
-// NEUE ROUTE: "/cashjb" - Kostenpflichtiges Modell mit Jailbreak
-app.post('/cashjb', async (req, res) => {
+// NEUE ROUTE: "/jbcash" - Kostenpflichtiges Modell mit Jailbreak
+app.post('/jbcash', async (req, res) => {
   const requestTimestamp = new Date().toISOString();
-  console.log(`== Neue Anfrage über /cashjb mit Jailbreak (${requestTimestamp}) ==`);
+  console.log(`== Neue Anfrage über /jbcash mit Jailbreak (${requestTimestamp}) ==`);
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25", true);
 });
 
@@ -614,8 +614,8 @@ app.get('/', (req, res) => {
       legacy: '/v1/chat/completions', // Legacy-Route ohne Modellzwang
       free: '/free',                  // Route mit kostenlosem Gemini-Modell
       paid: '/cash',                  // Route mit kostenpflichtigem Gemini-Modell
-      freeJailbreak: '/freejb',       // NEUE Route mit kostenlosem Modell und Jailbreak
-      paidJailbreak: '/cashjb'        // NEUE Route mit kostenpflichtigem Modell und Jailbreak
+      freeJailbreak: '/jbfree',       // NEUE Route mit kostenlosem Modell und Jailbreak
+      paidJailbreak: '/jbcash'        // NEUE Route mit kostenpflichtigem Modell und Jailbreak
     },
     features: {
       streaming: 'Aktiviert',

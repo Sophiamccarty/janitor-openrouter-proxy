@@ -199,25 +199,25 @@ function getSafetySettings(modelName) {
     'gemini-2.5-flash-preview:thinking'
   ];
 
+  // Bereinige zuerst den Modellnamen (Entferne trailing :thinking, da das keinen Einfluss auf Safety Settings hat)
+  const cleanModelName = modelName.replace(/:thinking$/, '');
+
   // Exakte Modellprüfung für unsere speziellen Modelle
-  if (modelName === 'google/gemini-2.5-pro-preview-03-25' || 
-      modelName === 'google/gemini-2.5-pro-preview-03-25:thinking') {
+  if (cleanModelName === 'google/gemini-2.5-pro-preview-03-25') {
     // Für die Preview-Version können wir alles auf OFF setzen
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
     });
     console.log('Gemini 2.5 Pro Preview erkannt: Verwende OFF für alle Safety-Einstellungen');
   } 
-  else if (modelName === 'google/gemini-2.5-pro-exp-03-25:free' || 
-           modelName === 'google/gemini-2.5-pro-exp-03-25:thinking') {
+  else if (cleanModelName === 'google/gemini-2.5-pro-exp-03-25:free') {
     // Für die Free-Version versuchen wir zuerst OFF
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
     });
-    console.log('Gemini 2.5 Pro Free/Thinking erkannt: Verwende OFF für alle Safety-Einstellungen');
+    console.log('Gemini 2.5 Pro Free erkannt: Verwende OFF für alle Safety-Einstellungen');
   }
-  else if (modelName === 'google/gemini-2.5-flash-preview' ||
-           modelName === 'google/gemini-2.5-flash-preview:thinking') {
+  else if (cleanModelName === 'google/gemini-2.5-flash-preview') {
     // Für die Flash-Modelle auch OFF verwenden
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
@@ -225,13 +225,13 @@ function getSafetySettings(modelName) {
     console.log('Gemini 2.5 Flash erkannt: Verwende OFF für alle Safety-Einstellungen');
   }
   // Fallback auf Modell-Listen-Prüfung für andere Modelle
-  else if (modelBlockNoneList.some(model => modelName.includes(model))) {
+  else if (modelBlockNoneList.some(model => cleanModelName.includes(model))) {
     // Ändere alle Thresholds auf BLOCK_NONE
     safetySettings.forEach(setting => {
       setting.threshold = 'BLOCK_NONE';
     });
   } 
-  else if (modelOffList.some(model => modelName.includes(model))) {
+  else if (modelOffList.some(model => cleanModelName.includes(model))) {
     // Setze alles auf OFF (auch CIVIC_INTEGRITY)
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
@@ -250,31 +250,19 @@ function addReasoningIfNeeded(body, modelName) {
   if (modelName.includes(':thinking')) {
     console.log(`Reasoning/Thinking für ${modelName} aktiviert`);
     
-    // Option 1: Direkter Parameter
-    newBody.include_reasoning = true;
+    // Vereinfachte Version für OpenRouter - nur das direkteste Format verwenden
+    // um Kompatibilitätsprobleme zu vermeiden
     
-    // Option 2: Detaillierte Reasoning-Konfiguration
-    newBody.reasoning = {
-      effort: "high",      // Hohe Anstrengung für gründliches Denken
-      max_tokens: 2000,    // Angemessene Token-Anzahl für komplexe Gedankengänge
-      exclude: false       // Reasoning in der Antwort beibehalten
-    };
-    
-    // Für den Fall, dass das Extra-Body-Format verwendet werden muss
+    // Verwende den simpleren Parameter, der nachweislich mit OpenRouter funktioniert
     if (!newBody.extra_body) {
       newBody.extra_body = {};
     }
+    
+    // Diese Parameter werden von OpenRouter für reasoning-fähige Modelle unterstützt
     newBody.extra_body.include_reasoning = true;
     
-    // Für Gemini-spezifische Konfiguration
-    if (!newBody.generation_config) {
-      newBody.generation_config = {};
-    }
-    
-    // Thinking Config für Gemini
-    newBody.generation_config.thinking_config = {
-      thinking_budget: 1024  // Angemessenes Budget für tiefes Denken
-    };
+    // Log für Debugging
+    console.log("Reasoning/Thinking aktiviert mit include_reasoning=true");
   }
   
   return newBody;
@@ -437,10 +425,22 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     // Modell bestimmen (entweder erzwungen oder aus dem Request)
     const modelName = forceModel || clientBody.model;
     
+    // Detaillierte Logs für Debugging
+    console.log(`Verwendetes Modell: ${modelName}`);
+    
+    // Überprüfe und korrigiere ggf. das Modellformat
+    let correctedModelName = modelName;
+    
+    // Wenn es ein Thinking-Modell ist, entferne temporär :thinking für Safety Settings
+    const isThinkingModel = modelName.includes(':thinking');
+    
+    // Safety-Settings ohne :thinking-Suffix
+    const modelForSafety = isThinkingModel ? modelName.replace(/:thinking$/, '') : modelName;
+    
     // Dynamische Safety Settings abhängig vom Modell
-    const dynamicSafetySettings = getSafetySettings(modelName);
+    const dynamicSafetySettings = getSafetySettings(modelForSafety);
 
-    // Safety settings hinzufügen und ggf. das vorgegebene Modell
+    // Safety settings hinzufügen und ggf. das vorgegebene Modell 
     let newBody = {
       ...clientBody,
       safety_settings: dynamicSafetySettings,
@@ -452,8 +452,36 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
       newBody.model = forceModel;
     }
     
+    // Handling für Flash Modelle
+    if (newBody.model.includes('gemini-2.5-flash-preview')) {
+      console.log("Flash-Modell erkannt, optimiere Request...");
+      
+      // Für das Flash-Modell müssen wir einige Parameter anpassen
+      newBody = {
+        ...newBody,
+        // Diese Modelle benötigen weniger komplexe Konfiguration
+        temperature: newBody.temperature || 0.7,
+        max_tokens: newBody.max_tokens || 1000,
+      };
+      
+      // Entferne komplexe Konfigurationen, die Fehler verursachen könnten
+      delete newBody.frequency_penalty;
+      delete newBody.presence_penalty;
+      delete newBody.logit_bias;
+    }
+    
     // Reasoning/Thinking hinzufügen, falls benötigt
-    newBody = addReasoningIfNeeded(newBody, modelName);
+    if (isThinkingModel) {
+      // Vereinfachte Thinking-Konfiguration für Kompatibilität
+      console.log("Aktiviere Thinking-Modus für dieses Modell");
+      newBody.extra_header = {
+        ...(newBody.extra_header || {}),
+        "X-Thinking": "true"
+      };
+      
+      // Alternative Konfiguration direkt im Body
+      newBody.include_reasoning = true;
+    }
 
     // Leite es an Openrouter weiter (mit Retry-Logik)
     const headers = {
@@ -464,11 +492,19 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
       'X-Title': 'Janitor.ai'                   // Hinzugefügt: Weitere Identifikation für OpenRouter
     };
     
+    // Für Thinking-Modelle einen speziellen Header hinzufügen
+    if (isThinkingModel) {
+      headers['X-Thinking'] = 'true';
+    }
+    
     // Füge Referrer auch im Body hinzu für vollständige Attribution
     if (!newBody.metadata) {
       newBody.metadata = {};
     }
     newBody.metadata.referer = 'https://janitor.ai/';
+    
+    // Detaillierte Logs für besseres Debugging
+    console.log("Request-Body für OpenRouter:", JSON.stringify(newBody).substr(0, 300) + "...");
     
     // Mit Retry-Logik anfragen - immer an den korrekten OpenRouter-Endpunkt
     // Für Streaming und reguläre Anfragen den gleichen Endpunkt verwenden
@@ -504,7 +540,7 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     
     // Prüfe, ob es eine Fehlerantwort von Openrouter ist
     if (response.data.error) {
-      console.log("Fehler erkannt in Openrouter-Antwort");
+      console.log("Fehler erkannt in Openrouter-Antwort:", JSON.stringify(response.data.error));
       
       // Prüfe auf den Quota-Fehler in der Antwort
       if (response.data.error.code === 429 || 
@@ -534,6 +570,20 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
         });
       }
       
+      // Modell-Fehler (besonders bei Thinking-Modellen)
+      if (isThinkingModel && 
+          (response.data.error.code === 400 || 
+           response.data.error.message?.includes('invalid_request_error'))) {
+        
+        return res.status(200).json({
+          choices: [{
+            message: {
+              content: "Es gibt ein Problem mit dem Thinking-Modell. Versuche es mit einem Standard-Modell wie /flash25 (ohne Thinking) oder /jbfree."
+            }
+          }]
+        });
+      }
+      
       // Andere Fehler
       return res.status(200).json({
         choices: [{
@@ -552,10 +602,27 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     console.error("Error in Proxy:", error.message);
     if (error.response) {
       console.error("Status:", error.response.status);
+      console.error("Response body:", JSON.stringify(error.response.data || {}).substr(0, 500));
     }
     
     // Extrahiere Fehlermeldung
     let errorMessage = "Unknown error";
+    
+    // Prüfe, ob dies ein Thinking-Modell ist
+    const isThinkingRequest = forceModel && forceModel.includes(':thinking');
+    
+    // Spezialbehandlung für Thinking-Modelle
+    if (isThinkingRequest && error.response?.status === 400) {
+      return res.status(200).json({
+        choices: [
+          {
+            message: {
+              content: "Das Thinking-Modell wird aktuell nicht unterstützt. Bitte verwende stattdessen /flash25 (ohne Thinking) oder ein anderes Modell wie /jbfree oder /jbcash."
+            }
+          }
+        ]
+      });
+    }
     
     // Prüfe auf verschiedene Fehlertypen
     if (error.code === 'ECONNABORTED') {
@@ -660,7 +727,20 @@ app.post('/flash25', async (req, res) => {
 app.post('/flash25thinking', async (req, res) => {
   const requestTimestamp = new Date().toISOString();
   console.log(`== Neue Anfrage über /flash25thinking (${requestTimestamp}) ==`);
-  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-flash-preview:thinking", true); // Mit Jailbreak
+  try {
+    // Detaillierte Logs für bessere Fehlerdiagnose
+    console.log("Flash25thinking Route wird verarbeitet...");
+    await handleProxyRequestWithModel(req, res, "google/gemini-2.5-flash-preview:thinking", true); // Mit Jailbreak
+  } catch (error) {
+    console.error("Kritischer Fehler in flash25thinking:", error);
+    res.status(200).json({
+      choices: [{
+        message: {
+          content: "Es gab ein technisches Problem mit dem Thinking-Modell. Versuche es mit /flash25 ohne Thinking oder /jbfree oder /jbcash als Alternative."
+        }
+      }]
+    });
+  }
 });
 
 // Bestehende Proxy-Route "/nofilter" - Modell frei wählbar
@@ -681,8 +761,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '1.6.0',
-    info: 'GEMINI UNBLOCKER V.1.3 by Sophiamccarty',
+    version: '1.6.1',
+    info: 'GEMINI UNBLOCKER V.1.4 by Sophiamccarty',
     usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI',
     endpoints: {
       standard: '/nofilter',          // Standard-Route ohne Modellzwang
@@ -699,7 +779,11 @@ app.get('/', (req, res) => {
       streaming: 'Aktiviert',
       dynamicSafety: 'Optimiert für Gemini 2.5 Pro und Flash Modelle (mit OFF-Setting)',
       jailbreak: 'Verfügbar über /jbfree, /jbcash, /jbnofilter, /flash25 und /flash25thinking',
-      reasoning: 'Verfügbar über /flash25thinking und bei allen :thinking Modellen'
+      reasoning: 'Verfügbar über /flash25thinking und bei allen :thinking Modellen (experimentell)'
+    },
+    tips: {
+      thinkingModels: "Flash25Thinking ist experimentell und funktioniert möglicherweise nicht mit allen OpenRouter API-Keys. Bei Problemen bitte /flash25 (ohne Thinking) verwenden.",
+      flashModels: "Die Flash-Modelle sind sehr schnell, aber möglicherweise nicht so kreativ wie die Pro-Modelle. Für Rollenspiele empfehlen wir /jbfree oder /jbcash."
     }
   });
 });

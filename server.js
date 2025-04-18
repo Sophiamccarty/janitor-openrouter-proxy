@@ -468,10 +468,9 @@ function addJailbreakToMessages(body) {
   return newBody;
 }
 
-// Maximal vereinfachte Fortsetzungs-Funktion für höchste Stabilität
+// Komplett überarbeitete Fortsetzungsfunktion ohne Streaming für höchste Stabilität
 async function continueIncompleteResponse(model, messages, previousContent, apiKey, res) {
-  console.log("Automatische Fortsetzung wird gestartet...");
-  let continuationFailed = false;
+  console.log("Automatische Fortsetzung wird gestartet - NON-STREAMING-MODUS");
   
   try {
     // Neuen Prompt erstellen, der die Fortsetzung anfragt
@@ -483,23 +482,22 @@ async function continueIncompleteResponse(model, messages, previousContent, apiK
       content: previousContent
     });
     
-    // Füge eine direkte Fortsetzungs-Aufforderung hinzu
+    // Füge eine Fortsetzungs-Aufforderung mit sehr klaren Anweisungen hinzu
     continuationMessages.push({
       role: "user",
-      content: "Bitte fahre genau dort fort, wo du aufgehört hast, ohne zu wiederholen. Setze den letzten Satz direkt fort."
+      content: "Der letzte Satz ist unvollständig abgebrochen. Setze genau dort fort, wo du aufgehört hast, ohne irgendetwas zu wiederholen. Beginne mit keiner Einleitung, sondern direkt mit der Fortsetzung des letzten abgebrochenen Satzes."
     });
     
-    // Neuen Request erstellen - so einfach wie möglich
+    // Neuen Request erstellen - NICHT-STREAMING Version für maximale Stabilität
     const continuationBody = {
       model: model,
       messages: continuationMessages,
-      stream: true,
-      max_tokens: 1024, // Beschränken, um Stabilität zu verbessern
-      temperature: 0.7  // Standardtemperatur
+      stream: false, // WICHTIG: KEIN Streaming für die Fortsetzung
+      max_tokens: 1024,
+      temperature: 0.7
     };
     
     // Nur die absolut nötigen Konfigurationen
-    // Safety Settings hinzufügen
     continuationBody.safety_settings = getSafetySettings(model);
     
     // Nur wenn es ein Thinking-Modell ist, Thinking hinzufügen
@@ -516,7 +514,7 @@ async function continueIncompleteResponse(model, messages, previousContent, apiK
       console.log("✓ Thinking für Fortsetzung aktiviert");
     }
     
-    // Sehr einfache Metadaten
+    // Minimale Metadaten
     continuationBody.metadata = {
       referer: 'https://janitor.ai/'
     };
@@ -528,108 +526,46 @@ async function continueIncompleteResponse(model, messages, previousContent, apiK
       'User-Agent': 'JanitorAI-Proxy/1.0'
     };
     
-    console.log("Sende Fortsetzungsanfrage...");
+    console.log("Sende NICHT-STREAM Fortsetzungsanfrage...");
     
-    // Direkte Anfrage ohne komplexe Optionen
+    // Direkte Anfrage ohne Streaming
     const continuationResponse = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions', 
       continuationBody, 
-      {
-        headers,
-        responseType: 'stream'
-      }
+      { headers }
     );
     
-    console.log("Fortsetzungsanfrage gesendet, verarbeite Stream...");
+    console.log("Fortsetzungsanfrage erfolgreich, sende Fortsetzung direkt an Client");
     
-    // Direkte Stream-Verarbeitung ohne komplexe Logik
-    // Erster Chunk muss speziell behandelt werden, um nahtlos zu sein
-    let firstChunkSent = false;
+    // Extrahiere den Fortsetzungstext
+    const continuationText = continuationResponse.data?.choices?.[0]?.message?.content || "";
     
-    continuationResponse.data.on('data', (chunk) => {
-      try {
-        if (continuationFailed) return;
-        
-        const chunkStr = chunk.toString();
-        
-        // Sende einen Übergangs-Text, wenn es der erste Chunk ist
-        if (!firstChunkSent) {
-          firstChunkSent = true;
-          
-          // Versuche, den ersten Textinhalt zu extrahieren
-          const contentMatch = chunkStr.match(/"content":"([^"]*)"/);
-          
-          if (contentMatch && contentMatch[1]) {
-            // Extrahiere den ersten Teil des Inhalts und sende ihn ohne die SSE-Einleitung
-            const firstContent = contentMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"');
-            res.write(`data: {"choices":[{"delta":{"content":" ${firstContent}"}}]}\n\n`);
-            
-            // Log zur Überprüfung
-            console.log("Fortsetzungsanfang gesendet: " + firstContent.substring(0, 30) + "...");
-            return;
-          }
-        }
-        
-        // Alle weiteren Chunks direkt weiterleiten
-        res.write(chunk);
-      } catch (err) {
-        // Auch bei Fehlern nicht abbrechen, sondern weitermachen
-        console.error("Fehler bei Fortsetzungs-Chunk:", err);
-        
-        // Versuche trotzdem, den ursprünglichen Chunk zu senden
-        try {
-          res.write(chunk);
-        } catch (writeErr) {
-          console.error("Kritischer Fehler beim Schreiben des Fortsetzungs-Chunks:", writeErr);
-          continuationFailed = true;
-        }
-      }
-    });
+    if (continuationText) {
+      // Sende den Fortsetzungstext als einen einzigen Chunk im Stream-Format an den Client
+      // Füge ein Leerzeichen am Anfang ein, um eine bessere Verbindung zum vorherigen Text zu haben
+      res.write(`data: {"choices":[{"delta":{"content":" ${continuationText}"}}]}\n\n`);
+      console.log("Fortsetzungstext gesendet (" + continuationText.length + " Zeichen)");
+    } else {
+      console.warn("Leere Fortsetzungsantwort erhalten");
+      res.write(`data: {"choices":[{"delta":{"content":" [Fortsetzung nicht verfügbar]"}}]}\n\n`);
+    }
     
-    // Ende des Fortsetzungsstreams
-    continuationResponse.data.on('end', () => {
-      console.log("Fortsetzungsstream beendet");
-      
-      if (continuationFailed) {
-        console.warn("Fortsetzungsstream wurde als fehlgeschlagen markiert");
-      }
-      
-      // Stream abschließen
-      try {
-        res.write('data: [DONE]\n\n');
-        res.end();
-        finalizeRequestLog();
-      } catch (err) {
-        console.error("Fehler beim Abschließen des Fortsetzungsstreams:", err);
-      }
-    });
+    // Stream beenden
+    res.write('data: [DONE]\n\n');
+    res.end();
+    finalizeRequestLog();
     
-    // Fehlerbehandlung für Fortsetzungsstream
-    continuationResponse.data.on('error', (error) => {
-      console.error("Fortsetzungsstream-Fehler:", error);
-      continuationFailed = true;
-      
-      // Minimale Fehlerbehandlung
-      try {
-        res.write(`data: {"choices":[{"delta":{"content":" [Fortsetzung unterbrochen]"}}]}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
-        finalizeRequestLog();
-      } catch (err) {
-        console.error("Kritischer Fehler bei Fortsetzungsstream-Fehlerbehandlung:", err);
-      }
-    });
   } catch (error) {
-    console.error("Grundlegender Fehler bei Fortsetzungsanfrage:", error);
+    console.error("Fehler bei Fortsetzungsanfrage:", error);
     
-    // Auch bei Fehlern immer etwas zurückgeben
+    // Bei Fehlern eine Notfallantwort senden
     try {
-      res.write(`data: {"choices":[{"delta":{"content":" [Fortsetzung nicht möglich]"}}]}\n\n`);
+      res.write(`data: {"choices":[{"delta":{"content":" [Fortsetzung fehlgeschlagen: ${error.message || 'Unbekannter Fehler'}]"}}]}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
       finalizeRequestLog();
     } catch (err) {
-      console.error("Absolut kritischer Fehler bei Fortsetzungsfehlerbehandlung:", err);
+      console.error("Kritischer Fehler beim Senden der Fehlermeldung:", err);
     }
   }
 }
@@ -1209,9 +1145,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '2.7.0',
-    info: 'GEMINI UNBLOCKER V.2.7 by Sophiamccarty',
-    usage: 'ULTRA-STABILE STREAMING, ANTI-PGSHAG2, AUTO-CONTINUATION',
+    version: '2.8.0',
+    info: 'GEMINI UNBLOCKER V.2.8 by Sophiamccarty',
+    usage: 'NO-STREAM CONTINUATION, ANTI-PGSHAG2, ULTRA-STABLE',
     endpoints: {
       standard: '/nofilter',
       legacy: '/v1/chat/completions',
@@ -1232,7 +1168,7 @@ app.get('/', (req, res) => {
       logging: 'Verbessert mit Status-Tracking und tatsächlicher Token-Nutzung',
       flashTokenLimit: 'Max 1024 Tokens für Flash-Modelle (verbesserte Stabilität)',
       autoJailbreak: 'Automatisch aktiviert für alle Flash-Modelle',
-      autoContinuation: 'Automatische Fortsetzung bei unvollständigen Antworten'
+      autoContinuation: 'Nicht-gestreamte Fortsetzung für maximale Stabilität'
     },
     thinkingModels: [
       'gemini-2.5-pro-preview-03-25',
@@ -1261,6 +1197,7 @@ app.get('/health', (req, res) => {
       thinkingBudget: 8192,
       streamHandler: 'Maximal vereinfacht für 100% Stabilität',
       streamTimeout: '10 Sekunden Timeout bei fehlenden Daten',
+      continuationMode: 'Nicht-gestreamter Fortsetzungsmodus für maximale Stabilität',
       logging: 'Zeigt tatsächlich verwendete Tokens an',
       autoJailbreak: 'Aktiviert für alle Flash-Modelle',
       flashTokenLimit: 'Auf 1024 beschränkt für Stabilität',
@@ -1281,5 +1218,5 @@ app.get('/health', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Proxy läuft auf Port ${PORT}`);
-  console.log(`${new Date().toISOString()} - Server gestartet mit Auto-Continuation für Flash-Modelle`);
+  console.log(`${new Date().toISOString()} - Server gestartet mit nicht-gestreamter Auto-Continuation für maximale Stabilität`);
 });

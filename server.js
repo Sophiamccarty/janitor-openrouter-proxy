@@ -1,3 +1,11 @@
+// Aktualisierte Modell-IDs mit Versionsnummern
+const MODEL_VERSIONS = {
+  GEMINI_PRO_FREE: "google/gemini-2.5-pro-exp-03-25:free",
+  GEMINI_PRO_PAID: "google/gemini-2.5-pro-preview-03-25",
+  GEMINI_FLASH: "google/gemini-2.5-flash-preview-04-17", // Aktualisiert mit Datums-Versionierung
+  GEMINI_FLASH_THINKING: "google/gemini-2.5-flash-preview-04-17:thinking" // Aktualisiert mit Datums-Versionierung
+};
+
 /*************************************************
  * server.js - Node/Express + Axios + CORS Proxy für JanitorAI
  *************************************************/
@@ -277,6 +285,8 @@ const JAILBREAK_TEXT = `## GAME SETTINGS
 
 // Dynamische Safety Settings basierend auf dem Modell
 function getSafetySettings(modelName) {
+  console.log(`Modellspezifische Safety-Settings werden generiert für: ${modelName}`);
+  
   // Basis-Safety-Settings (für die meisten Modelle)
   const defaultSafetySettings = [
     {
@@ -314,67 +324,59 @@ function getSafetySettings(modelName) {
     'gemma-3-27b-it'
   ];
 
-  // Gemini 2.0 flash unterstützt "OFF" für alle Kategorien
-  // Füge auch die Preview-Version hinzu, die definitiv OFF unterstützt
+  // Gemini 2.0+ unterstützt "OFF" für alle Kategorien
   const modelOffList = [
     'gemini-2.0-flash', 'gemini-2.0-flash-001',
     'gemini-2.0-flash-exp', 'gemini-2.0-flash-exp-image-generation',
-    'gemini-2.5-pro-preview-03-25',
-    'gemini-2.5-pro-exp-03-25:free'
+    'gemini-2.5-pro-preview',
+    'gemini-2.5-pro-exp',  
+    'gemini-2.5-flash-preview',
+    'gemini-2.5-flash-preview:thinking'
   ];
 
   // Exakte Modellprüfung für unsere speziellen Modelle
-  if (modelName === 'google/gemini-2.5-pro-preview-03-25') {
+  if (modelName === MODEL_VERSIONS.GEMINI_PRO_PAID || 
+      modelName.includes('gemini-2.5-pro-preview')) {
     // Für die Preview-Version können wir alles auf OFF setzen
+    console.log('Gemini 2.5 Pro Preview Modell erkannt: Verwende maximale Einschränkungsdeaktivierung');
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
     });
-    console.log('Gemini 2.5 Pro Preview erkannt: Verwende OFF für alle Safety-Einstellungen');
   } 
-  else if (modelName === 'google/gemini-2.5-pro-exp-03-25:free') {
+  else if (modelName === MODEL_VERSIONS.GEMINI_PRO_FREE || 
+           modelName.includes('gemini-2.5-pro-exp')) {
     // Für die Free-Version versuchen wir zuerst OFF
+    console.log('Gemini 2.5 Pro Exp Modell erkannt: Verwende maximale Einschränkungsdeaktivierung');
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
     });
-    console.log('Gemini 2.5 Pro Free erkannt: Verwende OFF für alle Safety-Einstellungen (experimentell)');
   }
-  // Erweiterte Prüfung für Flash-Modelle
-  else if (modelName === 'google/gemini-2.5-flash-preview' || 
-           modelName === 'google/gemini-2.5-flash-preview:thinking' ||
-           modelName.includes('gemini-2.5-flash')) {
-    // Für die Flash Preview-Version stärkere Deaktivierung aller Filter
-    safetySettings.forEach(setting => {
-      setting.threshold = 'OFF';  // Maximale Deaktivierung
-    });
-    // Füge zusätzliche Civic Integrity mit OFF hinzu, falls nicht vorhanden
-    const hasCivic = safetySettings.some(s => s.category === 'HARM_CATEGORY_CIVIC_INTEGRITY');
-    if (!hasCivic) {
-      safetySettings.push({
-        category: 'HARM_CATEGORY_CIVIC_INTEGRITY',
-        threshold: 'OFF'
-      });
-    }
-    // Füge zusätzliches Child Safety mit OFF hinzu
-    safetySettings.push({
-      category: 'HARM_CATEGORY_CHILD_SAFETY',
-      threshold: 'OFF'
-    });
+  else if (modelName === MODEL_VERSIONS.GEMINI_FLASH || 
+           modelName === MODEL_VERSIONS.GEMINI_FLASH_THINKING ||
+           modelName.includes('gemini-2.5-flash-preview')) {
+    // Für die Flash Preview-Version können wir alles auf OFF setzen
     console.log('Gemini 2.5 Flash Modell erkannt: Verwende maximale Einschränkungsdeaktivierung');
+    safetySettings.forEach(setting => {
+      setting.threshold = 'OFF';
+    });
   }
   // Fallback auf Modell-Listen-Prüfung für andere Modelle
   else if (modelBlockNoneList.some(model => modelName.includes(model))) {
     // Ändere alle Thresholds auf BLOCK_NONE
+    console.log('Modell mit BLOCK_NONE Unterstützung erkannt');
     safetySettings.forEach(setting => {
       setting.threshold = 'BLOCK_NONE';
     });
   } 
   else if (modelOffList.some(model => modelName.includes(model))) {
     // Setze alles auf OFF (auch CIVIC_INTEGRITY)
+    console.log('Modell mit OFF Unterstützung erkannt');
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
     });
   } else {
     // Unbekanntes Modell - wir versuchen es trotzdem, aber markieren es als Unsicherheit
+    console.log('WARNUNG: Unbekanntes Modell, versuche Standard-Deaktivierung');
     success = false;
   }
 
@@ -392,7 +394,7 @@ function supportsThinking(modelName) {
     'gemini-2.5-pro-exp',
     'gemini-2.0-flash-thinking',
     'gemini-2.5-flash-preview:thinking',
-    'gemini-2.5-flash-preview'
+    'gemini-2.5-flash-preview-04-17:thinking'
   ];
 
   // Prüfen, ob der Modellname einen der unterstützten Strings enthält
@@ -404,29 +406,29 @@ function addThinkingConfig(body) {
   // Kopie des Body erstellen
   const newBody = { ...body };
   
-  // Wenn das Modell Thinking unterstützt, konfigurieren wir es,
-  // aber wir loggen noch nicht die Token-Anzahl, da wir die tatsächlich 
-  // verwendeten Tokens erst bei der Antwort sehen
-  if (newBody.model && supportsThinking(newBody.model)) {
-    // Standard-Thinking-Budget verwenden (8192 ist ein ausgewogener Wert)
-    const thinkingBudget = 8192;
-    
-    // Wenn keine Konfiguration vorhanden, erstelle sie
-    if (!newBody.config) {
-      newBody.config = {};
+    // Wenn das Modell Thinking unterstützt, konfigurieren wir es,
+    // aber wir loggen noch nicht die Token-Anzahl, da wir die tatsächlich 
+    // verwendeten Tokens erst bei der Antwort sehen
+    if (newBody.model && supportsThinking(newBody.model)) {
+      // Standard-Thinking-Budget verwenden (8192 ist ein ausgewogener Wert)
+      const thinkingBudget = 8192;
+      
+      // Wenn keine Konfiguration vorhanden, erstelle sie
+      if (!newBody.config) {
+        newBody.config = {};
+      }
+      
+      // Thinking-Konfiguration hinzufügen
+      newBody.config.thinkingConfig = {
+        thinkingBudget: thinkingBudget
+      };
+      
+      // Logging nur mit "aktiviert" Status, ohne Token-Anzahl (die kommt später)
+      console.log(`✓ Thinking aktiviert (Budget: ${thinkingBudget})`);
+    } else {
+      // Thinking nicht verfügbar für dieses Modell
+      logThinkingStatus(false);
     }
-    
-    // Thinking-Konfiguration hinzufügen
-    newBody.config.thinkingConfig = {
-      thinkingBudget: thinkingBudget
-    };
-    
-    // Logging nur mit "aktiviert" Status, ohne Token-Anzahl (die kommt später)
-    console.log(`✓ Thinking aktiviert (Budget: ${thinkingBudget})`);
-  } else {
-    // Thinking nicht verfügbar für dieses Modell
-    logThinkingStatus(false);
-  }
   
   return newBody;
 }
@@ -463,8 +465,22 @@ function addJailbreakToMessages(body) {
 async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream = false) {
   let lastError;
   
+  // Verbesserte Logik für Rate-Limit-Fehler
+  const rateLimitMessages = [
+    "rate limited", "rate limit", "quota exceeded", "quota limit",
+    "too many requests", "429", "try again later"
+  ];
+  
+  // Verbesserte Logik für Content-Filter-Fehler
+  const contentFilterMessages = [
+    "prohibited content", "content policy", "unsafe content", 
+    "violates policy", "403", "content violation"
+  ];
+  
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
+      console.log(`API-Anfrage an OpenRouter (Versuch ${attempt + 1}/${maxRetries + 1}): ${isStream ? 'STREAM' : 'REGULAR'} Modus`);
+      
       // Stream-Modus oder regulärer Modus
       const response = isStream
         ? await apiClient.post(url, data, { 
@@ -475,6 +491,7 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
       
       // Für Stream-Antworten gibt es ein spezielles Handling später
       if (isStream) {
+        console.log(`✓ Stream-Verbindung hergestellt (Status: ${response.status})`);
         return response;
       }
       
@@ -482,6 +499,7 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
       if (response.data?.choices?.[0]?.message?.content === "" && 
           response.data.usage?.completion_tokens === 0) {
         
+        console.log('WARNUNG: Leere Antwort erkannt - wahrscheinlich Content-Filter');
         return {
           status: 200,
           data: {
@@ -531,21 +549,63 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
     } catch (error) {
       lastError = error;
       
-      // Prüfe, ob es ein Fehler ist, der ein Retry rechtfertigt
-      const status = error.response?.status;
+      // Erweiterte Fehlerdetails loggen
+      console.error(`Fehler bei API-Anfrage (Versuch ${attempt + 1}/${maxRetries + 1}):`);
+      console.error(`- Status: ${error.response?.status || 'Unbekannt'}`);
+      console.error(`- Nachricht: ${error.message || 'Keine Fehlermeldung'}`);
+      
+      if (error.response?.data) {
+        console.error(`- API-Fehler: ${JSON.stringify(error.response.data).substring(0, 200)}...`);
+      }
       
       // Log für fehlgeschlagenes Thinking bei unterstützten Modellen
       if (supportsThinking(data.model)) {
         logThinkingStatus(true, 0, error.message);
       }
       
-      // 429 (Rate Limit) oder 5xx (Server-Fehler) rechtfertigen Retry
-      const shouldRetry = (status === 429 || (status >= 500 && status < 600));
+      // Erweiterte Fehlerklassifizierung
+      const errorMessage = error.message || '';
+      const responseData = error.response?.data ? JSON.stringify(error.response.data) : '';
+      
+      // Rate-Limit-Fehler erkennen
+      const isRateLimitError = error.response?.status === 429 || 
+                              rateLimitMessages.some(msg => 
+                                errorMessage.toLowerCase().includes(msg) || 
+                                responseData.toLowerCase().includes(msg));
+      
+      // Content-Filter-Fehler erkennen
+      const isContentFilterError = error.response?.status === 403 || 
+                                  contentFilterMessages.some(msg => 
+                                    errorMessage.toLowerCase().includes(msg) || 
+                                    responseData.toLowerCase().includes(msg));
+      
+      // Server-Fehler erkennen
+      const isServerError = error.response?.status >= 500 && error.response?.status < 600;
+      
+      // Netzwerkfehler erkennen
+      const isNetworkError = !error.response || 
+                            error.code === 'ECONNABORTED' || 
+                            error.code === 'ECONNRESET' || 
+                            errorMessage.includes('timeout');
+      
+      // Logge den erkannten Fehlertyp
+      if (isRateLimitError) {
+        console.log('Rate-Limit-Fehler erkannt');
+      } else if (isContentFilterError) {
+        console.log('Content-Filter-Fehler erkannt');
+      } else if (isServerError) {
+        console.log('Server-Fehler erkannt');
+      } else if (isNetworkError) {
+        console.log('Netzwerk-Fehler erkannt');
+      }
+      
+      // Entscheide, ob ein Retry sinnvoll ist
+      const shouldRetry = isRateLimitError || isServerError || isNetworkError;
       
       if (shouldRetry && attempt < maxRetries) {
         // Exponential Backoff: 1s, 2s, 4s, ...
         const delay = 1000 * Math.pow(2, attempt);
-        console.log(`Wiederhole in ${delay}ms (Status ${status})`);
+        console.log(`Retry in ${delay/1000} Sekunden...`);
         await new Promise(resolve => setTimeout(resolve, delay));
         continue;
       }
@@ -566,6 +626,7 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
   let streamHasData = false;
   let streamErrorOccurred = false;
   let streamContent = "";  // Gesammelter Inhalt für Token-Schätzung
+  let lastChunkTime = Date.now();
   
   try {
     // SSE (Server-Sent Events) Header setzen
@@ -575,11 +636,36 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
       'Connection': 'keep-alive'
     });
 
+    // Timeout für Stream (falls keine Daten ankommen)
+    const streamTimeout = setTimeout(() => {
+      if (!streamHasData) {
+        console.error("Stream-Timeout: Keine Daten nach 30 Sekunden");
+        streamErrorOccurred = true;
+        logResponseStatus(false, 0, "Stream timeout - no data received");
+        logErrorMessageSent(true);
+        res.write(createStreamErrorMessage("The AI provider timed out. Please try again."));
+        res.end();
+        openRouterStream.destroy();
+        finalizeRequestLog();
+      }
+    }, 30000);
+
     // OpenRouter Stream an Client weiterleiten
     openRouterStream.on('data', (chunk) => {
       try {
+        // Zeitpunkt aktualisieren
+        lastChunkTime = Date.now();
+        
         // Prüfen, ob der Chunk einen Fehler enthält
         const chunkStr = chunk.toString();
+        
+        // Debug-Logging für empfangene Daten
+        if (!streamHasData) {
+          console.log(`Ersten Stream-Daten empfangen (${chunkStr.length} Bytes)`);
+          // Timeout löschen, weil wir Daten haben
+          clearTimeout(streamTimeout);
+        }
+        
         streamHasData = true;
         
         // Inhalt für Token-Schätzung sammeln
@@ -598,6 +684,7 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
             chunkStr.includes('429') ||
             chunkStr.includes('403')) {
           
+          console.error(`Fehler im Stream-Daten erkannt: "${chunkStr.substring(0, 100)}..."`);
           streamErrorOccurred = true;
           let errorMessage = "An error occurred with the AI provider.";
           
@@ -635,8 +722,12 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
     });
 
     openRouterStream.on('end', () => {
+      // Cleanup
+      clearTimeout(streamTimeout);
+      
       // Wenn Stream ohne Daten endet, ist das wahrscheinlich ein Fehler
       if (!streamHasData) {
+        console.error("Stream endete ohne Daten zu senden");
         logResponseStatus(false, 0, "Stream ended without data");
         logErrorMessageSent(true);
         res.write(createStreamErrorMessage("The AI provider returned an empty response. Please try again."));
@@ -644,6 +735,7 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
         // Nur als Erfolg markieren, wenn kein Fehler aufgetreten ist
         // Token-Anzahl schätzen aus gesammeltem Inhalt
         const estimatedTokens = estimateTokens(streamContent);
+        console.log(`Stream erfolgreich beendet (${estimatedTokens} geschätzte Tokens)`);
         logResponseStatus(true, estimatedTokens);
       }
       
@@ -652,7 +744,11 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
     });
 
     openRouterStream.on('error', (error) => {
+      // Cleanup
+      clearTimeout(streamTimeout);
+      
       streamErrorOccurred = true;
+      console.error(`Stream-Fehler: ${error.message}`);
       
       // Formatierte Fehlermeldung je nach Fehlertyp
       let errorMessage = "An error occurred with the AI provider.";
@@ -676,6 +772,7 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
       finalizeRequestLog();
     });
   } catch (error) {
+    console.error(`Fehler im Stream-Handler: ${error.message}`);
     // Log Fehler
     logResponseStatus(false, 0, error.message);
     logErrorMessageSent(true);
@@ -778,6 +875,14 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     
     // Mit Retry-Logik anfragen
     const endpoint = '/chat/completions';
+    
+    // Debug-Logging für den Request
+    console.log(`OpenRouter-Anfrage vorbereitet:`);
+    console.log(`- Modell: ${newBody.model}`);
+    console.log(`- Stream: ${isStreamingRequested ? 'Ja' : 'Nein'}`);
+    console.log(`- Jailbreak: ${useJailbreak ? 'Ja' : 'Nein'}`);
+    console.log(`- Safety Settings: ${JSON.stringify(newBody.safety_settings)}`);
+    console.log(`- Thinking Config: ${newBody.config?.thinkingConfig ? 'Ja' : 'Nein'}`);
     
     const response = await makeRequestWithRetry(
       endpoint,
@@ -901,32 +1006,32 @@ async function handleProxyRequest(req, res) {
 
 // Route "/free" - Erzwingt das kostenlose Gemini-Modell
 app.post('/free', async (req, res) => {
-  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-exp-03-25:free");
+  await handleProxyRequestWithModel(req, res, MODEL_VERSIONS.GEMINI_PRO_FREE);
 });
 
 // Route "/cash" - Erzwingt das kostenpflichtige Gemini-Modell
 app.post('/cash', async (req, res) => {
-  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25");
+  await handleProxyRequestWithModel(req, res, MODEL_VERSIONS.GEMINI_PRO_PAID);
 });
 
 // NEUE ROUTE: "/25flash" - Gemini 2.5 Flash Modell mit Jailbreak
 app.post('/25flash', async (req, res) => {
-  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-flash-preview", true); // Jailbreak automatisch aktiviert
+  await handleProxyRequestWithModel(req, res, MODEL_VERSIONS.GEMINI_FLASH, true); // Jailbreak automatisch aktiviert
 });
 
 // NEUE ROUTE: "/25flashthinking" - Gemini 2.5 Flash Thinking Modell mit Jailbreak
 app.post('/25flashthinking', async (req, res) => {
-  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-flash-preview:thinking", true); // Jailbreak automatisch aktiviert
+  await handleProxyRequestWithModel(req, res, MODEL_VERSIONS.GEMINI_FLASH_THINKING, true); // Jailbreak automatisch aktiviert
 });
 
 // NEUE ROUTE: "/jbfree" - Freies Modell mit Jailbreak
 app.post('/jbfree', async (req, res) => {
-  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-exp-03-25:free", true);
+  await handleProxyRequestWithModel(req, res, MODEL_VERSIONS.GEMINI_PRO_FREE, true);
 });
 
 // NEUE ROUTE: "/jbcash" - Kostenpflichtiges Modell mit Jailbreak
 app.post('/jbcash', async (req, res) => {
-  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25", true);
+  await handleProxyRequestWithModel(req, res, MODEL_VERSIONS.GEMINI_PRO_PAID, true);
 });
 
 // NEUE ROUTE: "/jbnofilter" - Jailbreak ohne Modellzwang
@@ -948,8 +1053,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '2.1.0',
-    info: 'GEMINI UNBLOCKER V.2.1 by Sophiamccarty',
+    version: '2.1.1',
+    info: 'GEMINI UNBLOCKER V.2.1.1 by Sophiamccarty',
     usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI WITH THINKING MODE',
     endpoints: {
       standard: '/nofilter',           // Standard-Route ohne Modellzwang
@@ -962,6 +1067,7 @@ app.get('/', (req, res) => {
       paidJailbreak: '/jbcash',        // Route mit kostenpflichtigem Modell und Jailbreak
       nofilterJailbreak: '/jbnofilter' // Route ohne Modellzwang mit Jailbreak
     },
+    modelVersions: MODEL_VERSIONS,
     features: {
       streaming: 'Aktiviert + verbesserte Fehlermeldungen',
       dynamicSafety: 'Optimiert für alle Gemini 2.5 Modelle (mit zusätzlichen Deaktivierungen für Flash)',
@@ -973,15 +1079,8 @@ app.get('/', (req, res) => {
       'gemini-2.5-pro-preview-03-25',
       'gemini-2.5-pro-exp-03-25:free',
       'gemini-2.0-flash-thinking',
-      'gemini-2.5-flash-preview:thinking',
-      'gemini-2.5-flash-preview'
-    ],
-    models: {
-      proFree: 'google/gemini-2.5-pro-exp-03-25:free',
-      proPaid: 'google/gemini-2.5-pro-preview-03-25',
-      flash: 'google/gemini-2.5-flash-preview',
-      flashThinking: 'google/gemini-2.5-flash-preview:thinking'
-    }
+      'gemini-2.5-flash-preview-04-17:thinking'
+    ]
   });
 });
 
@@ -998,23 +1097,12 @@ app.get('/health', (req, res) => {
       streamFehlermeldungen: 'Verbessert für benutzerfreundliche Meldungen',
       logging: 'Verbessert mit Benutzerfreundlichem Format',
       endpoints: {
-        total: 9,
-        withThinking: 9,
-        withJailbreak: 5
+        total: 8,
+        withThinking: 8,
+        withJailbreak: 3
       }
     },
-    flashModels: {
-      allWithJailbreak: true,
-      enhancedSafetyDisabling: true,
-      availableModels: [
-        'google/gemini-2.5-flash-preview',
-        'google/gemini-2.5-flash-preview:thinking'
-      ]
-    },
-    supportedModels: {
-      pro: ['google/gemini-2.5-pro-preview-03-25', 'google/gemini-2.5-pro-exp-03-25:free'],
-      flash: ['google/gemini-2.5-flash-preview', 'google/gemini-2.5-flash-preview:thinking']
-    }
+    modelVersions: MODEL_VERSIONS
   });
 });
 
@@ -1025,5 +1113,6 @@ app.listen(PORT, () => {
   console.log(`Proxy läuft auf Port ${PORT}`);
   console.log(`${new Date().toISOString()} - Server gestartet mit verbessertem Logging und Fehlerbehandlung`);
   console.log(`Flash-Modelle jetzt alle mit Jailbreak und verstärkten Filter-Deaktivierungen`);
+  console.log(`Modell-IDs aktualisiert auf Versionen mit Datums-Tags (${MODEL_VERSIONS.GEMINI_FLASH_THINKING})`);
   console.log(`====================\n`);
 });

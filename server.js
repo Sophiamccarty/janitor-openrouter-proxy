@@ -291,8 +291,8 @@ function shouldAutoJailbreak(modelName) {
 
 // Dynamische Safety Settings basierend auf dem Modell
 function getSafetySettings(modelName) {
-  // Basis-Safety-Settings (für die meisten Modelle)
-  const defaultSafetySettings = [
+  // ABSOLUTE MINIMALE Safety-Einstellungen für ALLE Modelle
+  const safetySettings = [
     {
       category: 'HARM_CATEGORY_HARASSMENT',
       threshold: 'OFF',
@@ -311,78 +311,32 @@ function getSafetySettings(modelName) {
     },
     {
       category: 'HARM_CATEGORY_CIVIC_INTEGRITY',
-      threshold: 'BLOCK_NONE',
+      threshold: 'OFF',
     },
   ];
 
-  // Mache eine Kopie, um die globalen Settings nicht zu ändern
-  const safetySettings = JSON.parse(JSON.stringify(defaultSafetySettings));
-  let success = true;
-
-  // Modelle, die nur BLOCK_NONE unterstützen (kein OFF)
+  // Bei Gemini/Vertex achten: manche Modelle verwenden nur BLOCK_NONE statt OFF
   const modelBlockNoneList = [
-    // Ältere Gemini-Modelle
-    'gemini-1.5-pro-001', 'gemini-1.5-flash-001',
-    'gemini-1.5-flash-8b-exp-0827', 'gemini-1.5-flash-8b-exp-0924',
-    'gemini-pro', 'gemini-1.0-pro', 'gemini-1.0-pro-001',
+    'gemini-1.5-pro-001', 
+    'gemini-1.5-flash-001',
+    'gemini-1.5-flash-8b-exp-0827', 
+    'gemini-1.5-flash-8b-exp-0924',
+    'gemini-pro', 
+    'gemini-1.0-pro', 
+    'gemini-1.0-pro-001',
     'gemma-3-27b-it'
   ];
 
-  // Gemini 2.0 flash unterstützt "OFF" für alle Kategorien
-  // Füge auch die Preview-Version hinzu, die definitiv OFF unterstützt
-  const modelOffList = [
-    'gemini-2.0-flash', 'gemini-2.0-flash-001',
-    'gemini-2.0-flash-exp', 'gemini-2.0-flash-exp-image-generation',
-    'gemini-2.5-pro-preview-03-25',
-    'gemini-2.5-pro-exp-03-25:free',  
-    'gemini-2.5-flash-preview',       
-    'gemini-2.5-flash-preview:thinking'
-  ];
-
-  // Exakte Modellprüfung für unsere speziellen Modelle
-  if (modelName === 'google/gemini-2.5-pro-preview-03-25') {
-    // Für die Preview-Version können wir alles auf OFF setzen
-    safetySettings.forEach(setting => {
-      setting.threshold = 'OFF';
-    });
-  } 
-  else if (modelName === 'google/gemini-2.5-pro-exp-03-25:free') {
-    // Für die Free-Version versuchen wir zuerst OFF
-    safetySettings.forEach(setting => {
-      setting.threshold = 'OFF';
-    });
-  }
-  else if (modelName === 'google/gemini-2.5-flash-preview') {
-    // Für die Flash Preview-Version können wir alles auf OFF setzen
-    safetySettings.forEach(setting => {
-      setting.threshold = 'OFF';
-    });
-  }
-  else if (modelName === 'google/gemini-2.5-flash-preview:thinking') {
-    // Für die Flash Preview Thinking-Version können wir alles auf OFF setzen
-    safetySettings.forEach(setting => {
-      setting.threshold = 'OFF';
-    });
-  }
-  // Fallback auf Modell-Listen-Prüfung für andere Modelle
-  else if (modelBlockNoneList.some(model => modelName.includes(model))) {
-    // Ändere alle Thresholds auf BLOCK_NONE
+  // Für Modelle, die nur BLOCK_NONE unterstützen
+  if (modelBlockNoneList.some(model => modelName.includes(model))) {
     safetySettings.forEach(setting => {
       setting.threshold = 'BLOCK_NONE';
     });
-  } 
-  else if (modelOffList.some(model => modelName.includes(model))) {
-    // Setze alles auf OFF (auch CIVIC_INTEGRITY)
-    safetySettings.forEach(setting => {
-      setting.threshold = 'OFF';
-    });
-  } else {
-    // Unbekanntes Modell - wir versuchen es trotzdem, aber markieren es als Unsicherheit
-    success = false;
   }
 
   // Logging des Safety-Status
-  logSafetyStatus(success);
+  console.log(`✓ Safety Filter deaktiviert für Modell: ${modelName}`);
+  logSafetyStatus(true);
 
   return safetySettings;
 }
@@ -987,7 +941,13 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     // Prüfe, ob Streaming angefordert wurde
     const isStreamingRequested = clientBody.stream === true;
     
-    // Dynamische Safety Settings abhängig vom Modell
+    // WICHTIG! Für Flash-Modelle Streaming immer aktivieren - es funktioniert am besten
+    if (modelName.toLowerCase().includes('flash') && !isStreamingRequested) {
+      clientBody.stream = true;
+      console.log("Streaming für Flash-Modell automatisch aktiviert");
+    }
+    
+    // Dynamische Safety Settings basierend auf dem Modell
     const dynamicSafetySettings = getSafetySettings(modelName);
 
     // Safety settings hinzufügen und ggf. das vorgegebene Modell
@@ -1002,10 +962,22 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     }
     
     // Flash-Modelle: bestimmte Parameter optimieren für bessere Stabilität
-    if (modelName.includes('flash')) {
+    if (modelName.toLowerCase().includes('flash')) {
       // Bei Flash-Modellen schränken wir den Max-Token-Wert ein, falls er zu hoch ist
       if (newBody.max_tokens > 1024) {
         newBody.max_tokens = 1024; // Reduzieren für mehr Stabilität
+      }
+      
+      // WICHTIG! Für Flash-Modelle temperature auf 0.7 setzen für bessere Stabilität
+      if (!newBody.temperature || newBody.temperature > 0.7) {
+        newBody.temperature = 0.7;
+        console.log("Temperature für Flash-Modell auf 0.7 gesetzt für bessere Stabilität");
+      }
+      
+      // Auch top_p reduzieren für bessere Stabilität
+      if (!newBody.top_p || newBody.top_p > 0.9) {
+        newBody.top_p = 0.9;
+        console.log("Top-P für Flash-Modell auf 0.9 gesetzt für bessere Stabilität");
       }
     }
     
@@ -1035,12 +1007,12 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
       newBody,
       headers,
       2,
-      isStreamingRequested
+      isStreamingRequested || newBody.stream === true // Stream-Modus, wenn explizit oder automatisch aktiviert
     );
 
-    // Stream-Anfrage behandeln - WICHTIG: Gib auch API-Key und originalBody mit!
-    if (isStreamingRequested && response.data) {
-      // Mit verbesserter Fehlerbehandlung, Modellnamen, originalBody und API-Key
+    // Stream-Anfrage behandeln
+    if ((isStreamingRequested || newBody.stream === true) && response.data) {
+      // Mit vereinfachtem Stream-Handler
       handleStreamResponse(response.data, res, modelName, newBody, apiKey);
       return;
     }
@@ -1257,12 +1229,13 @@ app.get('/health', (req, res) => {
     memory: process.memoryUsage(),
     timestamp: new Date().toISOString(),
     features: {
-      streaming: 'Ultra-Stabiles Streaming ohne pgshag2-Fehler',
+      streaming: 'Ultra-vereinfachtes Streaming mit minimaler Verarbeitung',
       thinking: 'Erzwungenes Reasoning für alle unterstützten Modelle',
       thinkingBudget: 8192,
-      streamHandler: 'Maximal vereinfacht für 100% Stabilität',
+      streamHandler: 'Absolut minimalistisch für 100% Stabilität',
       streamTimeout: '10 Sekunden Timeout bei fehlenden Daten',
-      continuationMode: 'Nahtlose Fortsetzung ohne Stream-Unterbrechung',
+      safetySettings: 'Universell deaktiviert für alle Modelle',
+      flashConfiguration: 'Automatisches Streaming, reduzierte Temperature (0.7)',
       logging: 'Zeigt tatsächlich verwendete Tokens an',
       autoJailbreak: 'Aktiviert für alle Flash-Modelle',
       flashTokenLimit: 'Auf 1024 beschränkt für Stabilität',
@@ -1283,5 +1256,5 @@ app.get('/health', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Proxy läuft auf Port ${PORT}`);
-  console.log(`${new Date().toISOString()} - Server gestartet mit nahtloser Stream-Fortsetzung ohne Unterbrechung V3.0`);
+  console.log(`${new Date().toISOString()} - Server gestartet mit ultrasimplem Streaming V3.5 (Universelle Filter-Deaktivierung)`);
 });

@@ -105,16 +105,18 @@ function logSafetyStatus(success) {
 
 // Funktion zum Aktualisieren des Thinking-Status
 function logThinkingStatus(active, tokens = 0, error = '') {
+  const thinkingBudget = 8192; // Das Standard-Budget
+  
   currentRequestState.thinkingStatus = { active, tokens, error };
   const symbol = active && !error ? '✓' : 'X';
   
   if (active && !error) {
     if (tokens === 0) {
       // Nur initiale Aktivierung ohne Token-Info
-      console.log(`✓ Thinking aktiviert`);
+      console.log(`✓ Thinking aktiviert (Budget: ${thinkingBudget})`);
     } else {
-      // Tatsächlich genutztes Token-Logging
-      console.log(`${symbol} Thinking erfolgreich (${tokens} Tokens tatsächlich verwendet)`);
+      // Tatsächlich genutztes Token-Logging mit Budget-Vergleich
+      console.log(`${symbol} Thinking erfolgreich (${tokens} von ${thinkingBudget} Tokens verwendet)`);
     }
   } else if (!active) {
     console.log(`ⓘ Thinking nicht verfügbar für dieses Modell`);
@@ -395,13 +397,16 @@ function supportsThinking(modelName) {
   const thinkingModels = [
     'gemini-2.5-pro-preview',
     'gemini-2.5-pro-exp',
+    'gemini-2.5-pro-preview-03-25',  // Vollständige Modellbezeichnung
+    'gemini-2.5-pro-exp-03-25:free', // Vollständige Modellbezeichnung mit Free-Flag
     'gemini-2.0-flash-thinking',
     'gemini-2.5-flash-preview:thinking',
-    'gemini-2.5-flash-preview'
+    'gemini-2.5-flash-preview',      // Flash unterstützt auch Thinking
+    'gemini-2.5-flash-preview-04-17' // Neuste Flash-Version mit Datum
   ];
 
   // Prüfen, ob der Modellname einen der unterstützten Strings enthält
-  return thinkingModels.some(model => modelName.includes(model));
+  return thinkingModels.some(model => modelName.toLowerCase().includes(model.toLowerCase()));
 }
 
 // Funktion zum Hinzufügen der Thinking-Konfiguration, wenn unterstützt
@@ -421,13 +426,17 @@ function addThinkingConfig(body) {
         newBody.config = {};
       }
       
-      // Thinking-Konfiguration hinzufügen
+      // Thinking-Konfiguration hinzufügen mit expliziter Aktivierung
       newBody.config.thinkingConfig = {
-        thinkingBudget: thinkingBudget
+        thinkingBudget: thinkingBudget,
+        enabled: true  // Explizit aktivieren - wichtig!
       };
       
       // Logging nur mit "aktiviert" Status, ohne Token-Anzahl (die kommt später)
       console.log(`✓ Thinking aktiviert (Budget: ${thinkingBudget})`);
+      
+      // Flag setzen, dass wir später den tatsächlichen Reasoning-Token-Verbrauch tracken wollen
+      currentRequestState.thinkingEnabled = true;
     } else {
       // Thinking nicht verfügbar für dieses Modell
       logThinkingStatus(false);
@@ -498,13 +507,14 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
       // Log für erfolgreiche Thinking-Anwendung bei unterstützten Modellen
       // Hier loggen wir die tatsächlich genutzten Tokens, nicht das Budget
       if (supportsThinking(data.model) && response.data?.usage) {
-        // Bei Google-Modellen gibt es auch prompt_tokens und completion_tokens
-        // Wenn es prompt_eval_count gibt, ist das Google's thinking count
-        const thinkingTokens = response.data.usage.prompt_eval_count || 
-                             response.data.usage.prompt_tokens || 0;
+        // Direkt nach native_tokens_reasoning suchen (neue OpenRouter-Antwortstruktur)
+        // Fallback auf andere verfügbare Token-Zähler
+        const reasoningTokens = response.data.usage.native_tokens_reasoning || 
+                              response.data.usage.prompt_eval_count || 
+                              response.data.usage.prompt_tokens || 0;
         
         // Aktualisiere den Thinking-Status mit tatsächlichen Token-Anzahl
-        logThinkingStatus(true, thinkingTokens);
+        logThinkingStatus(true, reasoningTokens);
       }
       
       // Antworttokens berechnen - sicherstellen, dass wir eine tatsächliche Zahl haben
@@ -553,12 +563,12 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
   throw lastError; // Sollte nie erreicht werden, aber zur Sicherheit
 }
 
-// **VEREINFACHTE** Stream-Handler-Funktion für Flash-Modelle
-function handleStreamResponse(openRouterStream, res, modelName = "") {
-  // Einfach die Daten weiterleiten, ohne komplizierte Verarbeitung
-  // Das sollte mehr Stabilität bringen
+// Verbesserte Stream-Handler-Funktion für Flash-Modelle mit Auto-Continuation
+function handleStreamResponse(openRouterStream, res, modelName = "", originalBody = {}, req = {}) {
+  // Einfach die Daten weiterleiten, aber bei Flash-Modellen Abbrüche erkennen
   let streamHasData = false;
   let streamErrorOccurred = false;
+  let accumulatedContent = ""; // Gesammelter Inhalt für Auto-Continue
   
   try {
     // SSE (Server-Sent Events) Header setzen
@@ -588,6 +598,27 @@ function handleStreamResponse(openRouterStream, res, modelName = "") {
           return;
         }
         
+        // Bei Flash-Modellen sammeln wir den Text für Auto-Continue
+        if (modelName.includes('flash')) {
+          try {
+            const lines = chunkStr.split('\n');
+            for (const line of lines) {
+              if (line.startsWith('data: ') && !line.includes('data: [DONE]')) {
+                try {
+                  const dataContent = JSON.parse(line.substring(6));
+                  if (dataContent.choices && dataContent.choices[0] && dataContent.choices[0].delta && dataContent.choices[0].delta.content) {
+                    accumulatedContent += dataContent.choices[0].delta.content;
+                  }
+                } catch (e) {
+                  // Ignoriere fehlerhafte JSON-Parsing
+                }
+              }
+            }
+          } catch (parseError) {
+            // Ignoriere Parsing-Fehler, diese sind normal während eines Streams
+          }
+        }
+        
         // Wenn kein Fehler, schreibe den Chunk normal weiter
         res.write(chunk);
       } catch (err) {
@@ -600,9 +631,44 @@ function handleStreamResponse(openRouterStream, res, modelName = "") {
       // Wenn der Stream ohne Daten endet
       if (!streamHasData) {
         res.write(createStreamErrorMessage("The AI provider returned an empty response."));
+        res.end();
+        finalizeRequestLog();
+        return;
       }
       
-      // Stream beenden
+      // Bei Flash-Modellen: Prüfe auf vorzeitigen Abbruch
+      if (modelName.includes('flash') && accumulatedContent.length > 0) {
+        // Erkennung von NSFW-Abbruch über einfache Heuristiken:
+        // 1. Endet der Text mit einem unvollständigen Satz?
+        // 2. Fehlt ein Abschlusszeichen wie . ! ?
+        const lastChar = accumulatedContent.trim().slice(-1);
+        const containsCompleteSentence = /[.!?]$/.test(accumulatedContent.trim());
+        const lastSentence = accumulatedContent.trim().split(/[.!?]/).pop();
+        const sentenceLength = lastSentence ? lastSentence.length : 0;
+        
+        // Prämature Abbruchserkennung - viele Bedingungen um Fehlalarme zu vermeiden
+        const isPrematurelyTerminated = (
+          // Langer Satz ohne Satzzeichen am Ende
+          (sentenceLength > 20 && !containsCompleteSentence) || 
+          // Text endet mit einem Komma, Semikolon oder Doppelpunkt - typisch für Abbrüche
+          [',', ';', ':', '-'].includes(lastChar) ||
+          // Oder Text ist lang genug, aber offensichtlich unvollständig (keine vollständigen Abschlüsse)
+          (accumulatedContent.length > 200 && !containsCompleteSentence && sentenceLength > 10)
+        );
+        
+        console.log(`Abbruchsprüfung: ${isPrematurelyTerminated ? "Abbruch erkannt" : "Kein Abbruch"} (${sentenceLength} Zeichen, Letztes Zeichen: '${lastChar}')`);
+        
+        // Bei erkanntem Abbruch: Auto-Continue starten
+        if (isPrematurelyTerminated) {
+          console.log("⚠️ Vorzeitige Beendigung erkannt, starte Auto-Continue...");
+          
+          // Auto-Continue als separate Funktion (asynchron)
+          requestContinuation(accumulatedContent, originalBody, modelName, req, res);
+          return; // Wichtig: Hier zurückkehren, damit das normale Stream-Ende nicht ausgeführt wird
+        }
+      }
+      
+      // Normales Stream-Ende, wenn kein Auto-Continue nötig ist
       res.write('data: [DONE]\n\n');
       res.end();
       finalizeRequestLog();
@@ -618,6 +684,155 @@ function handleStreamResponse(openRouterStream, res, modelName = "") {
   } catch (error) {
     console.error("Fatal stream error:", error);
     res.write(createStreamErrorMessage("A server error occurred."));
+    res.end();
+    finalizeRequestLog();
+  }
+}
+
+// Separate Funktion für die Fortsetzungsanfrage (Auto-Continue)
+async function requestContinuation(accumulatedContent, originalBody, modelName, req, res) {
+  try {
+    console.log("🔄 Bereite Fortsetzungsanfrage vor...");
+    
+    // Kopie des Original-Bodies erstellen
+    const continuationBody = JSON.parse(JSON.stringify(originalBody));
+    
+    // API-Key extrahieren
+    let apiKey = null;
+    
+    // Option 1: Authorization Header
+    if (req.headers && req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+      apiKey = req.headers.authorization.split(' ')[1].trim();
+    } 
+    // Option 2: x-api-key Header
+    else if (req.headers && req.headers['x-api-key']) {
+      apiKey = req.headers['x-api-key'].trim();
+    }
+    
+    if (!apiKey) {
+      console.error("Kein API-Key für Fortsetzung gefunden!");
+      res.write('data: [DONE]\n\n');
+      res.end();
+      finalizeRequestLog();
+      return;
+    }
+    
+    // Vorbereitung des Fortsetzungskontexts
+    if (!continuationBody.messages) {
+      continuationBody.messages = [];
+    }
+    
+    // Letzte Nutzernachricht finden
+    let lastUserMessageIndex = -1;
+    for (let i = continuationBody.messages.length - 1; i >= 0; i--) {
+      if (continuationBody.messages[i].role === 'user') {
+        lastUserMessageIndex = i;
+        break;
+      }
+    }
+    
+    if (lastUserMessageIndex === -1) {
+      // Keine Nutzernachricht gefunden, Ende
+      console.error("Keine Nutzernachricht gefunden für Fortsetzung!");
+      res.write('data: [DONE]\n\n');
+      res.end();
+      finalizeRequestLog();
+      return;
+    }
+    
+    // Füge bisherige Antwort als Assistentnachricht hinzu
+    continuationBody.messages.push({
+      role: 'assistant',
+      content: accumulatedContent
+    });
+    
+    // Füge Fortsetzungsanweisung hinzu
+    continuationBody.messages.push({
+      role: 'user',
+      content: "Bitte fahre mit deiner Antwort fort, genau dort wo du aufgehört hast, ohne etwas zu wiederholen oder zu erklären. Beginne direkt mit dem nächsten Wort/Satz. Wichtig: Keine Einleitung, keine Wiederholung, keine Erklärung. Nur Fortsetzung genau von der Stelle, wo der Text endete."
+    });
+    
+    // Headers für die Anfrage
+    const headers = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+      'User-Agent': 'JanitorAI-Proxy/1.0',
+      'HTTP-Referer': 'https://janitorai.com',
+      'X-Title': 'Janitor.ai - Auto-Continue'
+    };
+    
+    // Mit Retry-Logik anfragen
+    const endpoint = '/chat/completions';
+    console.log("🔄 Sende Fortsetzungsanfrage...");
+    
+    // Streamed Fortsetzung
+    continuationBody.stream = true;
+    
+    try {
+      const continuationResponse = await apiClient.post(endpoint, continuationBody, { 
+        headers, 
+        responseType: 'stream' 
+      });
+      
+      console.log("✓ Fortsetzungsanfrage erfolgreich gesendet");
+      
+      // Weiterleitung des Fortsetzungsstreams
+      const continuationStream = continuationResponse.data;
+      let isFirstChunk = true;
+      
+      continuationStream.on('data', (continuationChunk) => {
+        try {
+          const chunkStr = continuationChunk.toString();
+          
+          // Bei ersten Chunks nach Begrüßungen oder Wiederholungen filtern
+          if (isFirstChunk) {
+            isFirstChunk = false;
+            
+            // Prüfe, ob der erste Chunk Wiederholungen oder Standardphrasen enthält
+            // und filtere sie ggf. raus (komplexe Erkennung hier vereinfacht)
+            if (chunkStr.includes('Hier ist die Fortsetzung') || 
+                chunkStr.includes('Fortsetzung:') ||
+                chunkStr.includes('Natürlich, ich fahre fort')) {
+              // Ersten Chunk anpassen oder ignorieren
+              console.log("⚠️ Standardphrase in Fortsetzung erkannt, wird gefiltert");
+              return;
+            }
+          }
+          
+          // Chunk weiterleiten
+          res.write(continuationChunk);
+        } catch (err) {
+          console.error("Fehler bei der Verarbeitung des Fortsetzungschunks:", err);
+        }
+      });
+      
+      continuationStream.on('end', () => {
+        console.log("✓ Fortsetzung abgeschlossen");
+        // Stream insgesamt beenden
+        res.write('data: [DONE]\n\n');
+        res.end();
+        finalizeRequestLog();
+      });
+      
+      continuationStream.on('error', (error) => {
+        console.error("Fehler im Fortsetzungsstream:", error.message);
+        res.write(createStreamErrorMessage("Fehler in der Fortsetzung: " + error.message));
+        res.end();
+        finalizeRequestLog();
+      });
+      
+    } catch (error) {
+      console.error("Fehler bei der Fortsetzungsanfrage:", error);
+      // Fallback: Stream normal beenden
+      res.write('data: [DONE]\n\n');
+      res.end();
+      finalizeRequestLog();
+    }
+    
+  } catch (error) {
+    console.error("Fehler bei Auto-Continue:", error);
+    // Fallback: Stream normal beenden
+    res.write('data: [DONE]\n\n');
     res.end();
     finalizeRequestLog();
   }
@@ -699,12 +914,29 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
       newBody.model = forceModel;
     }
     
-    // Flash-Modelle: bestimmte Parameter optimieren für bessere Stabilität
+    // Flash-Modelle: bestimmte Parameter optimieren für bessere Stabilität und Geschwindigkeit
     if (modelName.includes('flash')) {
       // Bei Flash-Modellen schränken wir den Max-Token-Wert ein, falls er zu hoch ist
       if (newBody.max_tokens > 1024) {
         newBody.max_tokens = 1024; // Reduzieren für mehr Stabilität
       }
+      
+      // Optimierte Temperature für Flash-Modelle verwenden
+      // Eine niedrigere Temperature führt zu deterministischeren Antworten und kann schneller sein
+      if (newBody.temperature === undefined || newBody.temperature > 0.7) {
+        newBody.temperature = 0.7;
+      }
+      
+      // Top-P auf einen höheren Wert setzen für effizientere Decoding-Entscheidungen
+      if (newBody.top_p === undefined || newBody.top_p < 0.9) {
+        newBody.top_p = 0.9;
+      }
+      
+      // Frequency penalty reduzieren - nicht nötig bei Flash-Modellen
+      newBody.frequency_penalty = 0;
+      
+      // Presence penalty reduzieren - nicht nötig bei Flash-Modellen
+      newBody.presence_penalty = 0;
     }
     
     // Füge Thinking-Konfiguration hinzu, wenn das Modell es unterstützt
@@ -738,8 +970,10 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
 
     // Stream-Anfrage behandeln - KEINE Finalisierung hier, das übernimmt jetzt der Stream-Handler
     if (isStreamingRequested && response.data) {
-      // Mit verbesserter Fehlerbehandlung und Modellnamen
-      handleStreamResponse(response.data, res, modelName);
+      // Mit verbesserter Fehlerbehandlung, Modellnamen und Original-Body für Auto-Continue
+      // Wir übergeben auch den API-Key im Body für einfacheren Zugriff in Auto-Continue
+      newBody._apiKey = apiKey; // Speichere den API-Key temporär für Auto-Continue
+      handleStreamResponse(response.data, res, modelName, newBody, req);
       return;
     }
 
@@ -908,9 +1142,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '2.5.0',
-    info: 'GEMINI UNBLOCKER V.2.5 by Sophiamccarty',
-    usage: 'SIMPLIFIED STREAM HANDLER FOR BETTER STABILITY',
+    version: '2.6.0',
+    info: 'GEMINI UNBLOCKER V.2.6 by Sophiamccarty',
+    usage: 'OPTIMIZED REASONING + AUTO-CONTINUE FOR FLASH MODELS',
     endpoints: {
       standard: '/nofilter',           // Standard-Route ohne Modellzwang
       legacy: '/v1/chat/completions',  // Legacy-Route ohne Modellzwang
@@ -923,24 +1157,31 @@ app.get('/', (req, res) => {
       nofilterJailbreak: '/jbnofilter' // Route ohne Modellzwang mit Jailbreak
     },
     features: {
-      streaming: 'Vereinfacht für maximale Stabilität',
+      streaming: 'Erweitert mit Auto-Continue für NSFW-Abbrüche bei Flash-Modellen',
       dynamicSafety: 'Optimiert für alle Gemini 2.5 Modelle (mit OFF-Setting)',
       jailbreak: 'Verstärkt für alle Modelle + automatisch für Flash-Modelle',
-      thinking: 'Aktiv für alle unterstützten Modelle auch mit Streaming (Budget: 8192 Tokens)',
-      logging: 'Verbessert mit Status-Tracking und Token-Zählung',
-      flashTokenLimit: 'Max 1024 Tokens für Flash-Modelle (verbesserte Stabilität)',
-      autoJailbreak: 'Automatisch aktiviert für alle Flash-Modelle'
+      thinking: 'Explizit aktiviert (enabled: true) mit korrektem Token-Tracking',
+      logging: 'Verbessert mit "X von Y Tokens verwendet" Format für Thinking',
+      flashOptimization: 'Optimiert für Geschwindigkeit mit angepassten Parametern',
+      autoContinue: 'Automatische Fortsetzung bei vorzeitigem Stream-Abbruch (NSFW)'
     },
     thinkingModels: [
       'gemini-2.5-pro-preview-03-25',
       'gemini-2.5-pro-exp-03-25:free',
       'gemini-2.0-flash-thinking',
       'gemini-2.5-flash-preview:thinking',
-      'gemini-2.5-flash-preview'
+      'gemini-2.5-flash-preview',
+      'gemini-2.5-flash-preview-04-17'
     ],
     autoJailbreakModels: [
       'gemini-2.5-flash-preview',
-      'gemini-2.5-flash-preview:thinking'
+      'gemini-2.5-flash-preview:thinking',
+      'gemini-2.5-flash-preview-04-17'
+    ],
+    autoContinueModels: [
+      'gemini-2.5-flash-preview',
+      'gemini-2.5-flash-preview:thinking',
+      'gemini-2.5-flash-preview-04-17'
     ]
   });
 });
@@ -953,21 +1194,30 @@ app.get('/health', (req, res) => {
     memory: process.memoryUsage(),
     timestamp: new Date().toISOString(),
     features: {
-      thinking: 'Aktiviert für unterstützte Modelle auch im Stream-Modus',
+      thinking: 'Explizit aktiviert (enabled: true) mit korrektem Reasoning-Tracking',
       thinkingBudget: 8192,
-      streamHandler: 'Vereinfacht für maximale Stabilität',
-      logging: 'Verbessert mit Benutzerfreundlichem Format',
+      streamHandler: 'Erweitert mit Auto-Continue für abgebrochene NSFW-Inhalte',
+      logging: 'Verbessert mit "X von Y Tokens verwendet" Format',
       autoJailbreak: 'Aktiviert für alle Flash-Modelle',
-      flashTokenLimit: 'Auf 1024 beschränkt für Stabilität',
+      flashOptimization: 'Verbesserte Parameter für schnellere Antworten (Temperature, Top-P, etc.)',
       endpoints: {
         total: 9,
         withThinking: 8,
-        withJailbreak: '3 explizit + 2 automatisch'
+        withJailbreak: '3 explizit + 2 automatisch',
+        withAutoContinue: 'Alle Flash-Modelle bei NSFW-Abbrüchen'
       }
     },
     supportedModels: {
       pro: ['gemini-2.5-pro-preview-03-25', 'gemini-2.5-pro-exp-03-25:free'],
-      flash: ['gemini-2.5-flash-preview', 'gemini-2.5-flash-preview:thinking']
+      flash: ['gemini-2.5-flash-preview', 'gemini-2.5-flash-preview:thinking', 'gemini-2.5-flash-preview-04-17'],
+      thinkingModels: [
+        'gemini-2.5-pro-preview-03-25', 
+        'gemini-2.5-pro-exp-03-25:free',
+        'gemini-2.0-flash-thinking',
+        'gemini-2.5-flash-preview:thinking',
+        'gemini-2.5-flash-preview',
+        'gemini-2.5-flash-preview-04-17'
+      ]
     }
   });
 });
@@ -976,5 +1226,5 @@ app.get('/health', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Proxy läuft auf Port ${PORT}`);
-  console.log(`${new Date().toISOString()} - Server gestartet mit vereinfachtem Stream-Handler für bessere Stabilität`);
+  console.log(`${new Date().toISOString()} - Server gestartet mit verbesserter Thinking-Aktivierung und Auto-Continue`);
 });

@@ -468,9 +468,10 @@ function addJailbreakToMessages(body) {
   return newBody;
 }
 
-// Funktion zum Fortsetzens einer unvollständigen Antwort
+// Maximal vereinfachte Fortsetzungs-Funktion für höchste Stabilität
 async function continueIncompleteResponse(model, messages, previousContent, apiKey, res) {
   console.log("Automatische Fortsetzung wird gestartet...");
+  let continuationFailed = false;
   
   try {
     // Neuen Prompt erstellen, der die Fortsetzung anfragt
@@ -482,106 +483,184 @@ async function continueIncompleteResponse(model, messages, previousContent, apiK
       content: previousContent
     });
     
-    // Füge eine Fortsetzungs-Nachricht hinzu
+    // Füge eine direkte Fortsetzungs-Aufforderung hinzu
     continuationMessages.push({
       role: "user",
-      content: "Bitte fahre genau da fort, wo du aufgehört hast, ohne Wiederholungen. Setze die Antwort nahtlos fort."
+      content: "Bitte fahre genau dort fort, wo du aufgehört hast, ohne zu wiederholen. Setze den letzten Satz direkt fort."
     });
     
-    // Neuen Request erstellen
+    // Neuen Request erstellen - so einfach wie möglich
     const continuationBody = {
       model: model,
       messages: continuationMessages,
       stream: true,
-      // Andere Parameter wie im ursprünglichen Request übernehmen
       max_tokens: 1024, // Beschränken, um Stabilität zu verbessern
+      temperature: 0.7  // Standardtemperatur
     };
     
-    // Thinking hinzufügen, wenn unterstützt
-    let processedBody = addThinkingConfig(continuationBody);
-    
+    // Nur die absolut nötigen Konfigurationen
     // Safety Settings hinzufügen
-    processedBody.safety_settings = getSafetySettings(model);
+    continuationBody.safety_settings = getSafetySettings(model);
+    
+    // Nur wenn es ein Thinking-Modell ist, Thinking hinzufügen
+    if (supportsThinking(model)) {
+      if (!continuationBody.config) {
+        continuationBody.config = {};
+      }
+      
+      continuationBody.config.thinkingConfig = {
+        thinkingBudget: 8192,
+        forceReasoning: true
+      };
+      
+      console.log("✓ Thinking für Fortsetzung aktiviert");
+    }
+    
+    // Sehr einfache Metadaten
+    continuationBody.metadata = {
+      referer: 'https://janitor.ai/'
+    };
     
     // Headers für den Request
     const headers = {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${apiKey}`,
-      'User-Agent': 'JanitorAI-Proxy/1.0',
-      'HTTP-Referer': 'https://janitorai.com',
-      'X-Title': 'Janitor.ai'
+      'User-Agent': 'JanitorAI-Proxy/1.0'
     };
-    
-    // Metadata für Attribution
-    if (!processedBody.metadata) {
-      processedBody.metadata = {};
-    }
-    processedBody.metadata.referer = 'https://janitor.ai/';
     
     console.log("Sende Fortsetzungsanfrage...");
     
-    // Fortsetzungsanfrage senden
-    const continuationResponse = await apiClient.post('/chat/completions', processedBody, {
-      headers,
-      responseType: 'stream'
-    });
+    // Direkte Anfrage ohne komplexe Optionen
+    const continuationResponse = await axios.post(
+      'https://openrouter.ai/api/v1/chat/completions', 
+      continuationBody, 
+      {
+        headers,
+        responseType: 'stream'
+      }
+    );
     
-    // Stream-Verarbeitung für die Fortsetzung, aber ohne [DONE] am Ende
-    let firstChunkReceived = false;
+    console.log("Fortsetzungsanfrage gesendet, verarbeite Stream...");
+    
+    // Direkte Stream-Verarbeitung ohne komplexe Logik
+    // Erster Chunk muss speziell behandelt werden, um nahtlos zu sein
+    let firstChunkSent = false;
     
     continuationResponse.data.on('data', (chunk) => {
       try {
+        if (continuationFailed) return;
+        
         const chunkStr = chunk.toString();
         
-        // Das erste "data:" mit der Einleitung überspringen, um nahtlose Fortsetzung zu gewährleisten
-        if (!firstChunkReceived) {
-          firstChunkReceived = true;
-          // Versuchen, nur den Inhalt ohne Formatierung zu extrahieren
+        // Sende einen Übergangs-Text, wenn es der erste Chunk ist
+        if (!firstChunkSent) {
+          firstChunkSent = true;
+          
+          // Versuche, den ersten Textinhalt zu extrahieren
           const contentMatch = chunkStr.match(/"content":"([^"]*)"/);
-          if (contentMatch) {
-            // Nur den reinen Inhaltstext senden
-            const extractedContent = contentMatch[1];
-            res.write(`data: {"choices":[{"delta":{"content":"${extractedContent}"}}]}\n\n`);
+          
+          if (contentMatch && contentMatch[1]) {
+            // Extrahiere den ersten Teil des Inhalts und sende ihn ohne die SSE-Einleitung
+            const firstContent = contentMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"');
+            res.write(`data: {"choices":[{"delta":{"content":" ${firstContent}"}}]}\n\n`);
+            
+            // Log zur Überprüfung
+            console.log("Fortsetzungsanfang gesendet: " + firstContent.substring(0, 30) + "...");
             return;
           }
         }
         
-        // Weitere Chunks normal senden
+        // Alle weiteren Chunks direkt weiterleiten
         res.write(chunk);
       } catch (err) {
-        console.error("Error in continuation chunk processing:", err);
+        // Auch bei Fehlern nicht abbrechen, sondern weitermachen
+        console.error("Fehler bei Fortsetzungs-Chunk:", err);
+        
+        // Versuche trotzdem, den ursprünglichen Chunk zu senden
+        try {
+          res.write(chunk);
+        } catch (writeErr) {
+          console.error("Kritischer Fehler beim Schreiben des Fortsetzungs-Chunks:", writeErr);
+          continuationFailed = true;
+        }
       }
     });
     
+    // Ende des Fortsetzungsstreams
     continuationResponse.data.on('end', () => {
-      // Nach dem Ende diesen Stream fertig markieren
-      res.write('data: [DONE]\n\n');
-      res.end();
-      finalizeRequestLog();
+      console.log("Fortsetzungsstream beendet");
+      
+      if (continuationFailed) {
+        console.warn("Fortsetzungsstream wurde als fehlgeschlagen markiert");
+      }
+      
+      // Stream abschließen
+      try {
+        res.write('data: [DONE]\n\n');
+        res.end();
+        finalizeRequestLog();
+      } catch (err) {
+        console.error("Fehler beim Abschließen des Fortsetzungsstreams:", err);
+      }
     });
     
+    // Fehlerbehandlung für Fortsetzungsstream
     continuationResponse.data.on('error', (error) => {
-      console.error("Continuation stream error:", error);
-      res.write(`data: {"choices":[{"delta":{"content":"\\n[Fortsetzungsfehler: ${error.message}]"}}]}\n\n`);
+      console.error("Fortsetzungsstream-Fehler:", error);
+      continuationFailed = true;
+      
+      // Minimale Fehlerbehandlung
+      try {
+        res.write(`data: {"choices":[{"delta":{"content":" [Fortsetzung unterbrochen]"}}]}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        finalizeRequestLog();
+      } catch (err) {
+        console.error("Kritischer Fehler bei Fortsetzungsstream-Fehlerbehandlung:", err);
+      }
+    });
+  } catch (error) {
+    console.error("Grundlegender Fehler bei Fortsetzungsanfrage:", error);
+    
+    // Auch bei Fehlern immer etwas zurückgeben
+    try {
+      res.write(`data: {"choices":[{"delta":{"content":" [Fortsetzung nicht möglich]"}}]}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
       finalizeRequestLog();
-    });
-    
-  } catch (error) {
-    console.error("Fehler bei Fortsetzungsanfrage:", error);
-    res.write(`data: {"choices":[{"delta":{"content":"\\n[Fortsetzung fehlgeschlagen]"}}]}\n\n`);
-    res.write('data: [DONE]\n\n');
-    res.end();
-    finalizeRequestLog();
+    } catch (err) {
+      console.error("Absolut kritischer Fehler bei Fortsetzungsfehlerbehandlung:", err);
+    }
   }
 }
 
-// Verbesserte Stream-Handler-Funktion mit Auto-Continuation für Flash-Modelle
+// Maximal vereinfachte Stream-Handler-Funktion für höchste Stabilität
 function handleStreamResponse(openRouterStream, res, modelName = "", originalBody = {}, apiKey = "") {
   let streamHasData = false;
   let accumulatedContent = "";
   let isFlashModel = modelName.toLowerCase().includes('flash');
+  let streamFailed = false;
+  let streamEnded = false;
+  let noDataTimeout = null;
+  
+  console.log("Stream gestartet");
+  
+  // Timeout für No-Data-Situationen (10 Sekunden)
+  noDataTimeout = setTimeout(() => {
+    if (!streamHasData && !streamEnded) {
+      console.log("TIMEOUT: Keine Daten nach 10 Sekunden erhalten");
+      // Sende wenigstens eine minimale Antwort, damit Janitor nicht mit pgshag2 abbricht
+      try {
+        res.write(`data: {"choices":[{"delta":{"content":"OpenRouter hat keine Antwort geliefert, versuche es noch einmal."}}]}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        streamEnded = true;
+        finalizeRequestLog();
+      } catch (err) {
+        console.error("Fehler beim Senden der Timeout-Nachricht:", err);
+      }
+    }
+  }, 10000);
   
   try {
     // SSE Header setzen
@@ -591,105 +670,169 @@ function handleStreamResponse(openRouterStream, res, modelName = "", originalBod
       'Connection': 'keep-alive'
     });
 
-    // OpenRouter Stream an Client weiterleiten mit verbesserter Fehlertoleranz
+    // DIREKTE WEITERLEITUNG: Minimale Verarbeitung, maximale Stabilität
     openRouterStream.on('data', (chunk) => {
       try {
-        const chunkStr = chunk.toString();
+        // WICHTIG: Timeout löschen, sobald wir Daten haben
+        if (noDataTimeout) {
+          clearTimeout(noDataTimeout);
+          noDataTimeout = null;
+        }
+        
+        // Markiere, dass der Stream Daten enthält
         streamHasData = true;
         
-        // Versuche, den Inhalt zu extrahieren und zu akkumulieren
-        try {
-          const contentMatches = chunkStr.match(/"content":"([^"]*)"/g);
-          if (contentMatches) {
-            for (const match of contentMatches) {
-              const content = match.substring(11, match.length - 1);
-              accumulatedContent += content.replace(/\\n/g, "\n").replace(/\\"/g, '"');
-            }
-          }
-        } catch (e) {
-          console.warn("Warning: Could not extract content from chunk");
-        }
+        // Chunk in String umwandeln
+        const chunkStr = chunk.toString();
         
-        // Selbst bei Fehlern im Chunk, versuchen wir immer, etwas an den Client zu senden
-        if (chunkStr.includes('"error"')) {
-          console.warn("Stream warning: Error in chunk detected, but continuing");
-          
-          // Versuche, die Fehlermeldung zu extrahieren
+        // ABSOLUT MINIMALE Extraktion für automatische Fortsetzung
+        // Wir machen nur das Nötigste, um die Fortsetzung zu ermöglichen
+        if (isFlashModel) {
           try {
-            const errorMatch = chunkStr.match(/"error":\s*"([^"]*)"/);
-            const errorMessage = errorMatch ? errorMatch[1] : "Unknown error in stream";
-            
-            // Sende eine Warnung, aber zerstöre den Stream nicht
-            res.write(`data: {"choices":[{"delta":{"content":"\\n\\n[Warning: ${errorMessage}]\\n\\n"}}]}\n\n`);
+            const contentMatches = chunkStr.match(/"content":"([^"]*)"/g);
+            if (contentMatches) {
+              for (const match of contentMatches) {
+                const content = match.substring(11, match.length - 1);
+                // Sehr einfache Unescaping-Logik
+                accumulatedContent += content.replace(/\\n/g, "\n").replace(/\\"/g, '"');
+              }
+            }
           } catch (e) {
-            console.error("Failed to process error in chunk:", e);
+            // Ignorieren - wenn wir nicht extrahieren können, ist das OK
           }
         }
         
-        // In jedem Fall den Chunk an den Client weiterleiten
+        // ABSOLUT IMMER den Chunk direkt weiterleiten - ohne Bedingungen oder Filterung
         res.write(chunk);
       } catch (err) {
-        console.error("Error processing stream chunk:", err);
-        // Sende trotzdem einen Fallback-Output statt abzubrechen
-        res.write(`data: {"choices":[{"delta":{"content":"[Error during stream processing]"}}]}\n\n`);
+        console.error("Fehler bei Chunk-Verarbeitung, leite trotzdem weiter:", err);
+        
+        // Selbst bei Verarbeitungsfehlern versuchen wir, den ursprünglichen Chunk weiterzuleiten
+        try {
+          res.write(chunk);
+        } catch (writeErr) {
+          console.error("Kritischer Fehler beim Schreiben des Original-Chunks:", writeErr);
+          streamFailed = true;
+        }
       }
     });
 
-    // Verbesserte Stream-Ende-Behandlung
+    // Vereinfachte Stream-Ende-Behandlung
     openRouterStream.on('end', () => {
-      // Wenn der Stream ohne Daten endet
-      if (!streamHasData) {
-        res.write(createStreamErrorMessage("The AI provider returned an empty response."));
-        res.end();
-        finalizeRequestLog();
+      console.log("Stream von OpenRouter beendet");
+      streamEnded = true;
+      
+      // Cleanup des Timeouts
+      if (noDataTimeout) {
+        clearTimeout(noDataTimeout);
+        noDataTimeout = null;
+      }
+      
+      // Wenn der Stream keine Daten hatte, aber nicht als fehlgeschlagen markiert ist
+      if (!streamHasData && !streamFailed) {
+        console.warn("Stream endete ohne Daten");
+        try {
+          // Minimal-Antwort senden
+          res.write(`data: {"choices":[{"delta":{"content":"OpenRouter hat keine Antwort geliefert, versuche es noch einmal."}}]}\n\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+          finalizeRequestLog();
+          return;
+        } catch (err) {
+          console.error("Fehler beim Senden der Leer-Stream-Nachricht:", err);
+        }
+      }
+      
+      // Wenn der Stream als fehlgeschlagen markiert ist, nichts weiter tun
+      if (streamFailed) {
+        try {
+          res.write('data: [DONE]\n\n');
+          res.end();
+          finalizeRequestLog();
+        } catch (err) {
+          console.error("Fehler beim Beenden des fehlgeschlagenen Streams:", err);
+        }
         return;
       }
       
-      // Nur für Flash-Modelle: Prüfen, ob die Antwort unvollständig ist
+      // Auto-Continuation für Flash-Modelle
       if (isFlashModel && accumulatedContent && !isCompleteStatement(accumulatedContent)) {
         console.log("Unvollständige Antwort erkannt, starte Fortsetzung...");
         
-        // Automatische Fortsetzung starten
-        continueIncompleteResponse(
-          modelName, 
-          originalBody.messages || [], 
-          accumulatedContent,
-          apiKey,
-          res
-        );
-        
-        // Beachte: Hier NICHT res.end() aufrufen oder [DONE] senden,
-        // da continueIncompleteResponse den Stream fortführt und beendet
+        // Verzögerung vor der Fortsetzung (500ms), damit der Client die bisherigen Daten verarbeiten kann
+        setTimeout(() => {
+          try {
+            continueIncompleteResponse(
+              modelName, 
+              originalBody.messages || [], 
+              accumulatedContent,
+              apiKey,
+              res
+            );
+          } catch (err) {
+            console.error("Fehler bei der Auto-Continuation:", err);
+            try {
+              res.write('data: [DONE]\n\n');
+              res.end();
+              finalizeRequestLog();
+            } catch (endErr) {
+              console.error("Fehler beim Beenden nach Auto-Continuation-Fehler:", endErr);
+            }
+          }
+        }, 500);
       } else {
-        // Normale Stream-Beendigung
-        res.write('data: [DONE]\n\n');
-        res.end();
-        finalizeRequestLog();
+        // Normale Beendigung
+        try {
+          res.write('data: [DONE]\n\n');
+          res.end();
+          finalizeRequestLog();
+        } catch (err) {
+          console.error("Fehler beim normalen Beenden des Streams:", err);
+        }
       }
     });
 
-    // Verbesserte Fehlerbehandlung für den Stream
+    // Absolut vereinfachte Fehlerbehandlung
     openRouterStream.on('error', (error) => {
-      console.error("Stream error:", error.message);
+      console.error("Stream-Fehler:", error.message);
+      streamFailed = true;
+      streamEnded = true;
       
-      // Selbst bei Fehlern versuchen wir, eine Antwort zu senden
-      if (streamHasData) {
-        // Wenn wir bereits Daten haben, schicken wir eine Warnung und beenden normal
-        res.write(`data: {"choices":[{"delta":{"content":"\\n\\n[Stream interrupted: ${error.message}]"}}]}\n\n`);
-        res.write('data: [DONE]\n\n');
-      } else {
-        // Wenn keine Daten, dann eine formattierte Fehlermeldung senden
-        res.write(createStreamErrorMessage("Error: " + error.message));
+      // Cleanup des Timeouts
+      if (noDataTimeout) {
+        clearTimeout(noDataTimeout);
+        noDataTimeout = null;
       }
       
-      res.end();
-      finalizeRequestLog();
+      // Minimale Fehlerbehandlung - nur direkte Weiterleitung einer Fehlermeldung
+      try {
+        // Selbst bei Fehlern schicken wir IMMER eine Antwort
+        res.write(`data: {"choices":[{"delta":{"content":"OpenRouter-Stream unterbrochen. Bitte versuche es noch einmal."}}]}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        finalizeRequestLog();
+      } catch (err) {
+        console.error("Kritischer Fehler beim Senden der Fehlermeldung:", err);
+      }
     });
   } catch (error) {
-    console.error("Fatal stream error:", error);
-    res.write(createStreamErrorMessage("A server error occurred."));
-    res.end();
-    finalizeRequestLog();
+    console.error("Fataler Stream-Fehler:", error);
+    
+    // Cleanup des Timeouts
+    if (noDataTimeout) {
+      clearTimeout(noDataTimeout);
+      noDataTimeout = null;
+    }
+    
+    // Selbst bei kritischen Fehlern: Minimale Antwort senden
+    try {
+      res.write(`data: {"choices":[{"delta":{"content":"Ein kritischer Serverfehler ist aufgetreten. Bitte versuche es noch einmal."}}]}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+      finalizeRequestLog();
+    } catch (err) {
+      console.error("Absolut kritischer Fehler - konnte nicht einmal Fehlermeldung senden:", err);
+    }
   }
 }
 
@@ -1066,9 +1209,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '2.6.0',
-    info: 'GEMINI UNBLOCKER V.2.6 by Sophiamccarty',
-    usage: 'AUTO-CONTINUATION FOR FLASH MODELS, IMPROVED THINKING, BETTER ERROR HANDLING',
+    version: '2.7.0',
+    info: 'GEMINI UNBLOCKER V.2.7 by Sophiamccarty',
+    usage: 'ULTRA-STABILE STREAMING, ANTI-PGSHAG2, AUTO-CONTINUATION',
     endpoints: {
       standard: '/nofilter',
       legacy: '/v1/chat/completions',
@@ -1081,14 +1224,15 @@ app.get('/', (req, res) => {
       nofilterJailbreak: '/jbnofilter'
     },
     features: {
-      streaming: 'Fehlertolerantes Streaming mit Auto-Continuation',
+      streaming: 'Ultra-Stabiles Streaming ohne pgshag2-Fehler',
+      streamTimeout: 'Automatisches Timeout mit Fallback bei fehlenden Daten',
       dynamicSafety: 'Optimiert für alle Gemini 2.5 Modelle (mit OFF-Setting)',
       jailbreak: 'Verstärkt für alle Modelle + automatisch für Flash-Modelle',
       thinking: 'Erzwungenes Reasoning für alle unterstützten Modelle (Budget: 8192 Tokens)',
       logging: 'Verbessert mit Status-Tracking und tatsächlicher Token-Nutzung',
       flashTokenLimit: 'Max 1024 Tokens für Flash-Modelle (verbesserte Stabilität)',
       autoJailbreak: 'Automatisch aktiviert für alle Flash-Modelle',
-      autoContinuation: 'Automatische Fortsetzung bei unvollständigen Antworten bei Flash-Modellen'
+      autoContinuation: 'Automatische Fortsetzung bei unvollständigen Antworten'
     },
     thinkingModels: [
       'gemini-2.5-pro-preview-03-25',
@@ -1112,9 +1256,11 @@ app.get('/health', (req, res) => {
     memory: process.memoryUsage(),
     timestamp: new Date().toISOString(),
     features: {
+      streaming: 'Ultra-Stabiles Streaming ohne pgshag2-Fehler',
       thinking: 'Erzwungenes Reasoning für alle unterstützten Modelle',
       thinkingBudget: 8192,
-      streamHandler: 'Verbessert mit Auto-Continuation für Flash-Modelle',
+      streamHandler: 'Maximal vereinfacht für 100% Stabilität',
+      streamTimeout: '10 Sekunden Timeout bei fehlenden Daten',
       logging: 'Zeigt tatsächlich verwendete Tokens an',
       autoJailbreak: 'Aktiviert für alle Flash-Modelle',
       flashTokenLimit: 'Auf 1024 beschränkt für Stabilität',

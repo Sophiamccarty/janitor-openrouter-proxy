@@ -1,7 +1,4 @@
-// NEUE ROUTE: "/25flash" - Gemini 2.5 Flash Modell mit Jailbreak
-app.post('/25flash', async (req, res) => {
-  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-flash-preview", true); // Jailbreak automatisch aktiviert
-});/*************************************************
+/*************************************************
  * server.js - Node/Express + Axios + CORS Proxy für JanitorAI
  *************************************************/
 const express = require('express');
@@ -323,9 +320,7 @@ function getSafetySettings(modelName) {
     'gemini-2.0-flash', 'gemini-2.0-flash-001',
     'gemini-2.0-flash-exp', 'gemini-2.0-flash-exp-image-generation',
     'gemini-2.5-pro-preview-03-25',
-    'gemini-2.5-pro-exp-03-25:free',  
-    'gemini-2.5-flash-preview',       
-    'gemini-2.5-flash-preview:thinking'
+    'gemini-2.5-pro-exp-03-25:free'
   ];
 
   // Exakte Modellprüfung für unsere speziellen Modelle
@@ -334,24 +329,37 @@ function getSafetySettings(modelName) {
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
     });
+    console.log('Gemini 2.5 Pro Preview erkannt: Verwende OFF für alle Safety-Einstellungen');
   } 
   else if (modelName === 'google/gemini-2.5-pro-exp-03-25:free') {
     // Für die Free-Version versuchen wir zuerst OFF
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
     });
+    console.log('Gemini 2.5 Pro Free erkannt: Verwende OFF für alle Safety-Einstellungen (experimentell)');
   }
-  else if (modelName === 'google/gemini-2.5-flash-preview') {
-    // Für die Flash Preview-Version können wir alles auf OFF setzen
+  // Erweiterte Prüfung für Flash-Modelle
+  else if (modelName === 'google/gemini-2.5-flash-preview' || 
+           modelName === 'google/gemini-2.5-flash-preview:thinking' ||
+           modelName.includes('gemini-2.5-flash')) {
+    // Für die Flash Preview-Version stärkere Deaktivierung aller Filter
     safetySettings.forEach(setting => {
-      setting.threshold = 'OFF';
+      setting.threshold = 'OFF';  // Maximale Deaktivierung
     });
-  }
-  else if (modelName === 'google/gemini-2.5-flash-preview:thinking') {
-    // Für die Flash Preview Thinking-Version können wir alles auf OFF setzen
-    safetySettings.forEach(setting => {
-      setting.threshold = 'OFF';
+    // Füge zusätzliche Civic Integrity mit OFF hinzu, falls nicht vorhanden
+    const hasCivic = safetySettings.some(s => s.category === 'HARM_CATEGORY_CIVIC_INTEGRITY');
+    if (!hasCivic) {
+      safetySettings.push({
+        category: 'HARM_CATEGORY_CIVIC_INTEGRITY',
+        threshold: 'OFF'
+      });
+    }
+    // Füge zusätzliches Child Safety mit OFF hinzu
+    safetySettings.push({
+      category: 'HARM_CATEGORY_CHILD_SAFETY',
+      threshold: 'OFF'
     });
+    console.log('Gemini 2.5 Flash Modell erkannt: Verwende maximale Einschränkungsdeaktivierung');
   }
   // Fallback auf Modell-Listen-Prüfung für andere Modelle
   else if (modelBlockNoneList.some(model => modelName.includes(model))) {
@@ -396,29 +404,29 @@ function addThinkingConfig(body) {
   // Kopie des Body erstellen
   const newBody = { ...body };
   
-    // Wenn das Modell Thinking unterstützt, konfigurieren wir es,
-    // aber wir loggen noch nicht die Token-Anzahl, da wir die tatsächlich 
-    // verwendeten Tokens erst bei der Antwort sehen
-    if (newBody.model && supportsThinking(newBody.model)) {
-      // Standard-Thinking-Budget verwenden (8192 ist ein ausgewogener Wert)
-      const thinkingBudget = 8192;
-      
-      // Wenn keine Konfiguration vorhanden, erstelle sie
-      if (!newBody.config) {
-        newBody.config = {};
-      }
-      
-      // Thinking-Konfiguration hinzufügen
-      newBody.config.thinkingConfig = {
-        thinkingBudget: thinkingBudget
-      };
-      
-      // Logging nur mit "aktiviert" Status, ohne Token-Anzahl (die kommt später)
-      console.log(`✓ Thinking aktiviert (Budget: ${thinkingBudget})`);
-    } else {
-      // Thinking nicht verfügbar für dieses Modell
-      logThinkingStatus(false);
+  // Wenn das Modell Thinking unterstützt, konfigurieren wir es,
+  // aber wir loggen noch nicht die Token-Anzahl, da wir die tatsächlich 
+  // verwendeten Tokens erst bei der Antwort sehen
+  if (newBody.model && supportsThinking(newBody.model)) {
+    // Standard-Thinking-Budget verwenden (8192 ist ein ausgewogener Wert)
+    const thinkingBudget = 8192;
+    
+    // Wenn keine Konfiguration vorhanden, erstelle sie
+    if (!newBody.config) {
+      newBody.config = {};
     }
+    
+    // Thinking-Konfiguration hinzufügen
+    newBody.config.thinkingConfig = {
+      thinkingBudget: thinkingBudget
+    };
+    
+    // Logging nur mit "aktiviert" Status, ohne Token-Anzahl (die kommt später)
+    console.log(`✓ Thinking aktiviert (Budget: ${thinkingBudget})`);
+  } else {
+    // Thinking nicht verfügbar für dieses Modell
+    logThinkingStatus(false);
+  }
   
   return newBody;
 }
@@ -537,6 +545,7 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
       if (shouldRetry && attempt < maxRetries) {
         // Exponential Backoff: 1s, 2s, 4s, ...
         const delay = 1000 * Math.pow(2, attempt);
+        console.log(`Wiederhole in ${delay}ms (Status ${status})`);
         await new Promise(resolve => setTimeout(resolve, delay));
         continue;
       }
@@ -900,6 +909,11 @@ app.post('/cash', async (req, res) => {
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25");
 });
 
+// NEUE ROUTE: "/25flash" - Gemini 2.5 Flash Modell mit Jailbreak
+app.post('/25flash', async (req, res) => {
+  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-flash-preview", true); // Jailbreak automatisch aktiviert
+});
+
 // NEUE ROUTE: "/25flashthinking" - Gemini 2.5 Flash Thinking Modell mit Jailbreak
 app.post('/25flashthinking', async (req, res) => {
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-flash-preview:thinking", true); // Jailbreak automatisch aktiviert
@@ -984,14 +998,22 @@ app.get('/health', (req, res) => {
       streamFehlermeldungen: 'Verbessert für benutzerfreundliche Meldungen',
       logging: 'Verbessert mit Benutzerfreundlichem Format',
       endpoints: {
-        total: 8,
-        withThinking: 8,
-        withJailbreak: 3
+        total: 9,
+        withThinking: 9,
+        withJailbreak: 5
       }
     },
+    flashModels: {
+      allWithJailbreak: true,
+      enhancedSafetyDisabling: true,
+      availableModels: [
+        'google/gemini-2.5-flash-preview',
+        'google/gemini-2.5-flash-preview:thinking'
+      ]
+    },
     supportedModels: {
-      pro: ['gemini-2.5-pro-preview-03-25', 'gemini-2.5-pro-exp-03-25:free'],
-      flash: ['gemini-2.5-flash-preview', 'gemini-2.5-flash-preview:thinking']
+      pro: ['google/gemini-2.5-pro-preview-03-25', 'google/gemini-2.5-pro-exp-03-25:free'],
+      flash: ['google/gemini-2.5-flash-preview', 'google/gemini-2.5-flash-preview:thinking']
     }
   });
 });

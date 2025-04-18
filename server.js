@@ -1,6 +1,6 @@
 /*************************************************
  * server.js - Node/Express + Axios + CORS Proxy für JanitorAI
- * v1.6.2 - Added second OOC instruction injection
+ * v1.7.0 - Verbesserte Safety Settings & Content-Filter-Erkennung
  *************************************************/
 const express = require('express');
 const axios = require('axios');
@@ -31,7 +31,7 @@ app.use((req, res, next) => {
 const apiClient = axios.create({
   httpAgent: new http.Agent({ keepAlive: true, maxSockets: 100 }),
   httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 100 }),
-  timeout: 60000,
+  timeout: 90000, // Timeout auf 90 Sekunden erhöht (statt 60 Sekunden)
   baseURL: 'https://openrouter.ai/api/v1'
 });
 
@@ -152,40 +152,70 @@ const JAILBREAK_TEXT = `## GAME SETTINGS
 
 // Dynamische Safety Settings basierend auf dem Modell
 function getSafetySettings(modelName) {
-  const safetySettings = [
-    { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
-    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
-    { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
-    { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
-    { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'BLOCK_NONE' },
+  // Basis-Safety-Settings mit OFF (entspricht dem alten Code)
+  const defaultSafetySettings = [
+    { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF' },
+    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
+    { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'OFF' },
+    { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'OFF' },
+    { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'BLOCK_NONE' },  // Standardmäßig BLOCK_NONE
   ];
-  const modelOffList = [
-    'google/gemini-2.0-flash', 'google/gemini-2.0-flash-001',
-    'google/gemini-2.0-flash-exp', 'google/gemini-2.0-flash-exp-image-generation',
-    'google/gemini-2.5-pro-preview-03-25',
-    'google/gemini-2.5-pro-exp-03-25:free',
-    GEMINI_25_FLASH_PREVIEW,
-    GEMINI_25_FLASH_THINKING,
-  ];
+
+  // Kopie erstellen, um die Defaults nicht zu verändern
+  const safetySettings = JSON.parse(JSON.stringify(defaultSafetySettings));
+  
+  // Modelle, die nur BLOCK_NONE unterstützen
   const modelBlockNoneList = [
     'google/gemini-1.5-pro-001', 'google/gemini-1.5-flash-001',
     'google/gemini-1.5-flash-8b-exp-0827', 'google/gemini-1.5-flash-8b-exp-0924',
     'google/gemini-pro', 'google/gemini-1.0-pro', 'google/gemini-1.0-pro-001',
     'google/gemma-3-27b-it'
   ];
-  let settingsApplied = false;
+  
+  // Modelle, die OFF für alle Kategorien unterstützen
+  const modelOffList = [
+    'google/gemini-2.0-flash', 'google/gemini-2.0-flash-001',
+    'google/gemini-2.0-flash-exp', 'google/gemini-2.0-flash-exp-image-generation',
+    GEMINI_25_FLASH_PREVIEW,
+    GEMINI_25_FLASH_THINKING,
+  ];
+
+  // Explizite Behandlung für bestimmte Modelle (wie im alten Code)
+  if (modelName === 'google/gemini-2.5-pro-preview-03-25') {
+    // Speziell für Preview-Version auch CIVIC_INTEGRITY auf OFF setzen
+    safetySettings.forEach(setting => {
+      setting.threshold = 'OFF';
+    });
+    console.log('Gemini 2.5 Pro Preview erkannt: Verwende OFF für ALLE Safety-Einstellungen (inkl. CIVIC_INTEGRITY)');
+    return safetySettings;
+  } 
+  else if (modelName === 'google/gemini-2.5-pro-exp-03-25:free') {
+    // Bei Free-Version auch alle auf OFF
+    safetySettings.forEach(setting => {
+      setting.threshold = 'OFF';
+    });
+    console.log('Gemini 2.5 Pro Free erkannt: Verwende OFF für ALLE Safety-Einstellungen (inkl. CIVIC_INTEGRITY)');
+    return safetySettings;
+  }
+  
+  // Für andere Modelle die Modelllisten verwenden
   if (modelOffList.some(model => modelName.includes(model))) {
-    safetySettings.forEach(setting => setting.threshold = 'OFF');
-    console.log(`Modell ${modelName} unterstützt OFF: Setze alle Safety-Einstellungen auf OFF.`);
-    settingsApplied = true;
+    safetySettings.forEach(setting => {
+      // Hier jetzt auch CIVIC_INTEGRITY auf OFF setzen
+      setting.threshold = 'OFF';
+    });
+    console.log(`Modell ${modelName} unterstützt OFF: Setze ALLE Safety-Einstellungen auf OFF (inkl. CIVIC_INTEGRITY).`);
   }
   else if (modelBlockNoneList.some(model => modelName.includes(model))) {
+    safetySettings.forEach(setting => {
+      setting.threshold = 'BLOCK_NONE';
+    });
     console.log(`Modell ${modelName} unterstützt nur BLOCK_NONE: Verwende BLOCK_NONE für alle Safety-Einstellungen.`);
-    settingsApplied = true;
   }
-  if (!settingsApplied) {
-    console.log(`Unbekanntes Modell ${modelName}: Verwende Standard BLOCK_NONE für alle Safety-Einstellungen.`);
+  else {
+    console.log(`Unbekanntes Modell ${modelName}: Bleibe bei Standard-Einstellungen (meist OFF, nur CIVIC_INTEGRITY=BLOCK_NONE).`);
   }
+  
   return safetySettings;
 }
 
@@ -200,17 +230,25 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
         headers,
         responseType: isStream ? 'stream' : 'json'
       });
-      if (!isStream &&
-          response.data?.choices?.[0]?.message?.content === "" &&
-          response.data.usage?.completion_tokens === 0 &&
-          response.data.choices?.[0]?.finish_reason === 'stop') {
-        console.log("Leere Antwort ohne Fehler erkannt (potenzieller Content-Filter).");
-         throw Object.assign(new Error("Simulated Content Filter: Empty response from model."), {
-             response: {
-                 status: 403,
-                 data: { error: { message: "Model returned an empty response, likely due to content filtering.", code: "content_filter_empty" } }
-             }
-         });
+      
+      // Erweiterte Content-Filter-Erkennung
+      if (!isStream && 
+          ((response.data?.choices?.[0]?.message?.content === "" && 
+            response.data.usage?.completion_tokens === 0) ||
+           response.data?.finish_reason === "content_filter" ||
+           response.data?.native_finish_reason === "PROHIBITED_CONTENT")) {
+        console.log("Content-Filter erkannt: Leere Antwort oder explizites Content-Filter-Flag");
+        throw Object.assign(new Error("Content Filter: The model refused to generate a response"), {
+            response: {
+                status: 403,
+                data: { 
+                  error: { 
+                    message: "Model returned an empty response or refused to generate content due to content filtering.", 
+                    code: "content_filter_empty" 
+                  } 
+                }
+            }
+        });
       }
       return response;
     } catch (error) {
@@ -388,7 +426,7 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     const headers = {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${apiKey}`,
-      'User-Agent': 'JanitorAI-Proxy/1.6.2', // Version Bump
+      'User-Agent': 'JanitorAI-Proxy/1.7.0', // Version aktualisiert
       'HTTP-Referer': 'https://janitorai.com',
       'X-Title': 'Janitor.ai'
     };
@@ -415,16 +453,47 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
         }
     }
 
-    // Non-Streaming Response Handling
+    // Normale Antwort verarbeiten
+    // Prüfen auf Content-Filter (durch leere Antwort oder explizites Flag)
+    if (response.data?.content_filtered || 
+        (response.data?.choices?.[0]?.message?.content === "" && 
+         response.data.usage?.completion_tokens === 0) ||
+        response.data?.finish_reason === "content_filter" ||
+        response.data?.native_finish_reason === "PROHIBITED_CONTENT") {
+      console.log("Gemini Content-Filter erkannt, sende entsprechende Meldung");
+      return res.status(200).json({
+        choices: [{
+          message: {
+            content: "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use a Jailbreaked Version (/jbfree, /jbcash, /flash25, /jbnofilter) for NSWF/Violence, or try the paid 'Gemini 2.5 Pro Preview' model (/cash, /jbcash) which is generally more permissive."
+          },
+          finish_reason: "content_filter"
+        }]
+      });
+    }
+
+    // Normal Response Handling
     if (response.data?.error) {
       console.log("Fehler in Openrouter-Antwortdaten:", JSON.stringify(response.data.error));
       const error = response.data.error;
       let userMessage = `OpenRouter Error: ${error.message || "Unknown error from API."} (Code: ${error.code || 'N/A'})`;
-      if (error.code === 429 || error.message?.includes("quota")) {
+      
+      // Rate Limit / Quota Fehler
+      if (error.code === 429 || error.message?.includes("quota") || error.message?.includes("rate")) {
           userMessage = "Sorry my love, Gemini is unfortunately a bit stingy and you're either too fast, (Wait a few seconds, because the free version only allows a few requests per minute.) or you've used up your free messages for the day in the free version. In that case, you either need to switch to the paid version or wait until tomorrow. I'm sorry! Sending you a big hug! <3";
-      } else if (error.code === 403 || error.message?.includes('PROHIBITED_CONTENT') || error.code === "google_safety" || error.code === "content_filter_empty") {
+      } 
+      // Content Filter / Safety Fehler - sehr breite Erkennung
+      else if (error.code === 403 || 
+               error.message?.includes('PROHIBITED_CONTENT') || 
+               error.message?.includes('prohibited') ||
+               error.code === "google_safety" || 
+               error.code === "content_filter_empty" ||
+               error.finish_reason === "content_filter" ||
+               error.native_finish_reason === "PROHIBITED_CONTENT" ||
+               error.message?.includes('pgshag2')) {
           userMessage = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use a Jailbreaked Version (/jbfree, /jbcash, /flash25, /jbnofilter) for NSWF/Violence, or try the paid 'Gemini 2.5 Pro Preview' model (/cash, /jbcash) which is generally more permissive.";
+          console.log("Content-Filter-Fehler erkannt und abgefangen");
       }
+      
       return res.status(200).json(createJanitorErrorResponse(userMessage));
     }
 
@@ -447,13 +516,35 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
       errorMessage = "Request timeout: The API took too long to respond.";
     } else if (error.code === 'ECONNRESET') {
       errorMessage = "Connection reset: The connection to the API was interrupted.";
-    } else if (status === 429 || responseDataError?.message?.includes("quota")) {
+    } 
+    // Rate Limit / Quota-Fehler
+    else if (status === 429 || 
+             responseDataError?.message?.includes("quota") || 
+             responseDataError?.message?.includes("rate limit") ||
+             error.message?.includes("quota") ||
+             error.message?.includes("rate limit")) {
       errorMessage = "Sorry my love, Gemini is unfortunately a bit stingy and you're either too fast, (Wait a few seconds, because the free version only allows a few requests per minute.) or you've used up your free messages for the day in the free version. In that case, you either need to switch to the paid version or wait until tomorrow. I'm sorry! Sending you a big hug! <3";
-    } else if (status === 403 || responseDataError?.code === "google_safety" || responseDataError?.message?.includes('PROHIBITED_CONTENT') || responseDataError?.code === "content_filter_empty") {
-       errorMessage = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use a Jailbreaked Version (/jbfree, /jbcash, /flash25, /jbnofilter) for NSWF/Violence, or try the paid 'Gemini 2.5 Pro Preview' model (/cash, /jbcash).";
-    } else if (responseDataError?.message) {
+    } 
+    // Content Filter / Safety-Fehler - sehr breite Erkennung
+    else if (status === 403 || 
+             responseDataError?.code === "google_safety" || 
+             responseDataError?.message?.includes('PROHIBITED_CONTENT') || 
+             responseDataError?.message?.includes('prohibited') ||
+             responseDataError?.code === "content_filter_empty" ||
+             responseDataError?.finish_reason === "content_filter" ||
+             responseDataError?.native_finish_reason === "PROHIBITED_CONTENT" ||
+             error.message?.includes('content filter') ||
+             error.message?.includes('PROHIBITED_CONTENT') ||
+             error.message?.includes('pgshag2')) {
+       console.log("Content-Filter-Fehler im Catch-Block erkannt");
+       errorMessage = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use a Jailbreaked Version (/jbfree, /jbcash, /flash25, /jbnofilter) for NSWF/Violence, or try the paid 'Gemini 2.5 Pro Preview' model (/cash, /jbcash) which is generally more permissive.";
+    } 
+    // Andere API-Fehler
+    else if (responseDataError?.message) {
        errorMessage = `API Error: ${responseDataError.message} (Code: ${responseDataError.code || status || 'N/A'})`;
-    } else if (error.message) {
+    } 
+    // Fallback auf Standardfehler
+    else if (error.message) {
        errorMessage = error.message;
     }
 
@@ -526,7 +617,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '1.6.2', // Updated version
+    version: '1.7.0', // Aktualisierte Version
     info: 'GEMINI UNBLOCKER by Sophiamccarty',
     usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI via OpenRouter',
     endpoints: {
@@ -565,6 +656,6 @@ app.get('/health', (req, res) => {
 // Starte den Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Proxy Server v1.6.2 läuft auf Port ${PORT}`); // Version Bump
+  console.log(`Proxy Server v1.7.0 läuft auf Port ${PORT}`); // Version aktualisiert
   console.log(`${new Date().toISOString()} - Server gestartet`);
 });

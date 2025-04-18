@@ -109,7 +109,13 @@ function logThinkingStatus(active, tokens = 0, error = '') {
   const symbol = active && !error ? '✓' : 'X';
   
   if (active && !error) {
-    console.log(`${symbol} Thinking erfolgreich (${tokens} Tokens)`);
+    if (tokens === 0) {
+      // Nur initiale Aktivierung ohne Token-Info
+      console.log(`✓ Thinking aktiviert`);
+    } else {
+      // Tatsächlich genutztes Token-Logging
+      console.log(`${symbol} Thinking erfolgreich (${tokens} Tokens tatsächlich verwendet)`);
+    }
   } else if (!active) {
     console.log(`ⓘ Thinking nicht verfügbar für dieses Modell`);
   } else {
@@ -387,27 +393,29 @@ function addThinkingConfig(body) {
   // Kopie des Body erstellen
   const newBody = { ...body };
   
-  // Prüfen, ob das Modell Thinking unterstützt
-  if (newBody.model && supportsThinking(newBody.model)) {
-    // Standard-Thinking-Budget verwenden (8192 ist ein ausgewogener Wert)
-    const thinkingBudget = 8192;
-    
-    // Wenn keine Konfiguration vorhanden, erstelle sie
-    if (!newBody.config) {
-      newBody.config = {};
+    // Wenn das Modell Thinking unterstützt, konfigurieren wir es,
+    // aber wir loggen noch nicht die Token-Anzahl, da wir die tatsächlich 
+    // verwendeten Tokens erst bei der Antwort sehen
+    if (newBody.model && supportsThinking(newBody.model)) {
+      // Standard-Thinking-Budget verwenden (8192 ist ein ausgewogener Wert)
+      const thinkingBudget = 8192;
+      
+      // Wenn keine Konfiguration vorhanden, erstelle sie
+      if (!newBody.config) {
+        newBody.config = {};
+      }
+      
+      // Thinking-Konfiguration hinzufügen
+      newBody.config.thinkingConfig = {
+        thinkingBudget: thinkingBudget
+      };
+      
+      // Logging nur mit "aktiviert" Status, ohne Token-Anzahl (die kommt später)
+      console.log(`✓ Thinking aktiviert (Budget: ${thinkingBudget})`);
+    } else {
+      // Thinking nicht verfügbar für dieses Modell
+      logThinkingStatus(false);
     }
-    
-    // Thinking-Konfiguration hinzufügen
-    newBody.config.thinkingConfig = {
-      thinkingBudget: thinkingBudget
-    };
-    
-    // Vorläufiges Logging - die tatsächlichen Tokens sehen wir erst später
-    logThinkingStatus(true, thinkingBudget);
-  } else {
-    // Thinking nicht verfügbar für dieses Modell
-    logThinkingStatus(false);
-  }
   
   return newBody;
 }
@@ -472,16 +480,23 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
       }
       
       // Log für erfolgreiche Thinking-Anwendung bei unterstützten Modellen
-      if (supportsThinking(data.model) && response.data?.usage?.completion_tokens) {
+      // Hier loggen wir die tatsächlich genutzten Tokens, nicht das Budget
+      if (supportsThinking(data.model) && response.data?.usage) {
+        // Bei Google-Modellen gibt es auch prompt_tokens und completion_tokens
+        // Wenn es prompt_eval_count gibt, ist das Google's thinking count
+        const thinkingTokens = response.data.usage.prompt_eval_count || 
+                             response.data.usage.prompt_tokens || 0;
+        
         // Aktualisiere den Thinking-Status mit tatsächlichen Token-Anzahl
-        logThinkingStatus(true, response.data.usage.completion_tokens);
+        logThinkingStatus(true, thinkingTokens);
       }
       
-      // Antworttokens berechnen
+      // Antworttokens berechnen - sicherstellen, dass wir eine tatsächliche Zahl haben
       let responseTokens = 0;
       if (response.data?.usage?.completion_tokens) {
         responseTokens = response.data.usage.completion_tokens;
       } else if (response.data?.choices?.[0]?.message?.content) {
+        // Schätzung basierend auf Inhaltstext
         responseTokens = estimateTokens(response.data.choices[0].message.content);
       }
       
@@ -526,6 +541,7 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
 async function handleStreamResponse(openRouterStream, res, modelName = "") {
   let streamHasData = false;
   let streamErrorOccurred = false;
+  let streamContent = "";  // Gesammelter Inhalt für Token-Schätzung
   
   try {
     // SSE (Server-Sent Events) Header setzen
@@ -541,6 +557,14 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
         // Prüfen, ob der Chunk einen Fehler enthält
         const chunkStr = chunk.toString();
         streamHasData = true;
+        
+        // Inhalt für Token-Schätzung sammeln
+        // Das Format ist: data: {"choices":[{"delta":{"content":"Textinhalt"}}]}\n\n
+        // Wir extrahieren den Inhalt, wenn vorhanden
+        const contentMatch = chunkStr.match(/"content":"([^"]*)"/);
+        if (contentMatch && contentMatch[1]) {
+          streamContent += contentMatch[1];
+        }
         
         // Debug: Nach Fehlertypen in den Stream-Daten suchen
         if (chunkStr.includes('"error"') || 
@@ -594,7 +618,9 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
         res.write(createStreamErrorMessage("The AI provider returned an empty response. Please try again."));
       } else if (!streamErrorOccurred) {
         // Nur als Erfolg markieren, wenn kein Fehler aufgetreten ist
-        logResponseStatus(true, 0); // Token-Anzahl ist im Streaming-Modus nicht zuverlässig ermittelbar
+        // Token-Anzahl schätzen aus gesammeltem Inhalt
+        const estimatedTokens = estimateTokens(streamContent);
+        logResponseStatus(true, estimatedTokens);
       }
       
       finalizeRequestLog();
@@ -859,8 +885,8 @@ app.post('/cash', async (req, res) => {
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25");
 });
 
-// NEUE ROUTE: "/2.5flashthinking" - Gemini 2.5 Flash Thinking Modell
-app.post('/2.5flashthinking', async (req, res) => {
+// NEUE ROUTE: "/25flashthinking" - Gemini 2.5 Flash Thinking Modell
+app.post('/25flashthinking', async (req, res) => {
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-flash-preview:thinking");
 });
 
@@ -874,8 +900,8 @@ app.post('/jbcash', async (req, res) => {
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25", true);
 });
 
-// NEUE ROUTE: "/jbnotfilter" - Jailbreak ohne Modellzwang
-app.post('/jbnotfilter', async (req, res) => {
+// NEUE ROUTE: "/jbnofilter" - Jailbreak ohne Modellzwang
+app.post('/jbnofilter', async (req, res) => {
   await handleProxyRequestWithModel(req, res, null, true);
 });
 
@@ -901,15 +927,15 @@ app.get('/', (req, res) => {
       legacy: '/v1/chat/completions',  // Legacy-Route ohne Modellzwang
       free: '/free',                   // Route mit kostenlosem Gemini-Modell
       paid: '/cash',                   // Route mit kostenpflichtigem Gemini-Modell
-      flash: '/2.5flashthinking',      // Route mit Gemini 2.5 Flash Preview Thinking
+      flash: '/25flashthinking',      // Route mit Gemini 2.5 Flash Preview Thinking
       freeJailbreak: '/jbfree',        // Route mit kostenlosem Modell und Jailbreak
       paidJailbreak: '/jbcash',        // Route mit kostenpflichtigem Modell und Jailbreak
-      nofilterJailbreak: '/jbnotfilter' // Route ohne Modellzwang mit Jailbreak
+      nofilterJailbreak: '/jbnofilter' // Route ohne Modellzwang mit Jailbreak
     },
     features: {
       streaming: 'Aktiviert + verbesserte Fehlermeldungen',
       dynamicSafety: 'Optimiert für alle Gemini 2.5 Modelle (mit OFF-Setting)',
-      jailbreak: 'Verfügbar über /jbfree, /jbcash und /jbnotfilter',
+      jailbreak: 'Verfügbar über /jbfree, /jbcash und /jbnofilter',
       thinking: 'Aktiv für alle unterstützten Modelle auch mit Streaming (Budget: 8192 Tokens)',
       logging: 'Verbessert mit Status-Tracking und Token-Zählung'
     },

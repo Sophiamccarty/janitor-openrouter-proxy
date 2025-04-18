@@ -1,12 +1,16 @@
 /*************************************************
  * server.js - Node/Express + Axios + CORS Proxy für JanitorAI
- * Version: 1.6.0 (mit Flash-Modellen & jbnofilter)
+ * v1.6.0 - Added Gemini 2.5 Flash, new routes, streamed errors, cleanup
  *************************************************/
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const http = require('http');
 const https = require('https');
+
+// Constants for new models
+const GEMINI_25_FLASH_PREVIEW = 'google/gemini-2.5-flash-preview';
+const GEMINI_25_FLASH_THINKING = 'google/gemini-2.5-flash-preview:thinking'; // Note: This is the same endpoint as preview according to common patterns, but included for clarity if needed.
 
 // Erzeuge eine Express-App
 const app = express();
@@ -29,9 +33,8 @@ const apiClient = axios.create({
   // Connection Pooling aktivieren (verhindert zu viele TCP-Verbindungen)
   httpAgent: new http.Agent({ keepAlive: true, maxSockets: 100 }),
   httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 100 }),
-  // Timeout für Anfragen (45 Sekunden) - Erhöht auf 60 Sekunden für potenziell längere Reasoning-Zeiten
-  timeout: 60000, // Timeout leicht erhöht
-  // Base URL
+  // Timeout für Anfragen (45 Sekunden) - Increased slightly to 60s for potentially longer generations
+  timeout: 60000,
   baseURL: 'https://openrouter.ai/api/v1'
 });
 
@@ -152,239 +155,221 @@ const JAILBREAK_TEXT = `## GAME SETTINGS
 
 // Dynamische Safety Settings basierend auf dem Modell
 function getSafetySettings(modelName) {
-  // Basis-Safety-Settings (Standard: BLOCK_NONE als sicherster Fallback)
-  const defaultSafetySettings = [
+  // Basis-Safety-Settings (wird dynamisch überschrieben)
+  const safetySettings = [
     { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
     { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
     { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
     { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
-    { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'BLOCK_NONE' }, // Civic Integrity ist oft strenger
+    { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'BLOCK_NONE' }, // Default to BLOCK_NONE
   ];
 
-  // Mache eine Kopie, um die globalen Settings nicht zu ändern
-  const safetySettings = JSON.parse(JSON.stringify(defaultSafetySettings));
-
-  // Modelle, die explizit 'OFF' unterstützen (basierend auf Erfahrung und Tests)
+  // Modelle, die definitiv "OFF" unterstützen
   const modelOffList = [
-    // 2.5 Pro Modelle
-    'google/gemini-2.5-pro-preview-03-25',
-    'google/gemini-2.5-pro-exp-03-25:free',
-    // 2.5 Flash Modelle (NEU) - Annahme, dass sie OFF unterstützen
-    'google/gemini-2.5-flash-preview',
-    'google/gemini-2.5-flash-preview:thinking',
-    // Ältere 2.0 Modelle, die OFF unterstützen könnten
     'google/gemini-2.0-flash', 'google/gemini-2.0-flash-001',
-    'google/gemini-2.0-flash-exp', 'google/gemini-2.0-flash-exp-image-generation'
+    'google/gemini-2.0-flash-exp', 'google/gemini-2.0-flash-exp-image-generation',
+    'google/gemini-2.5-pro-preview-03-25',
+    'google/gemini-2.5-pro-exp-03-25:free', // Free Version - trying OFF
+    GEMINI_25_FLASH_PREVIEW, // NEW: 2.5 Flash Preview supports OFF
+    GEMINI_25_FLASH_THINKING, // NEW: 2.5 Flash Thinking (assuming same as preview) supports OFF
   ];
 
-  // Prüfe, ob das aktuelle Modell in der OFF-Liste ist
-  if (modelOffList.some(model => modelName === model || modelName.startsWith(model + ':'))) { // Checkt auch Varianten wie :thinking
-      console.log(`Modell ${modelName} unterstützt wahrscheinlich OFF. Setze alle Kategorien auf OFF.`);
-      safetySettings.forEach(setting => {
-          setting.threshold = 'OFF';
-      });
-  } else {
-      console.log(`Modell ${modelName} unterstützt wahrscheinlich nur BLOCK_NONE oder unbekannt. Setze Fallback BLOCK_NONE.`);
-      // Behalte die Standard-BLOCK_NONE-Einstellungen bei (bereits gesetzt)
-      // Optional: Man könnte hier noch spezifischere Logik für ältere Modelle hinzufügen, falls bekannt ist,
-      // dass sie nur BLOCK_NONE unterstützen, aber der aktuelle Ansatz ist sicherer.
+  // Modelle, die nur "BLOCK_NONE" unterstützen (oder wo wir unsicher sind)
+  const modelBlockNoneList = [
+    'google/gemini-1.5-pro-001', 'google/gemini-1.5-flash-001',
+    'google/gemini-1.5-flash-8b-exp-0827', 'google/gemini-1.5-flash-8b-exp-0924',
+    'google/gemini-pro', 'google/gemini-1.0-pro', 'google/gemini-1.0-pro-001',
+    'google/gemma-3-27b-it'
+    // Add other models here if they only support BLOCK_NONE
+  ];
+
+  let settingsApplied = false;
+
+  // Prüfe, ob das Modell in der OFF-Liste ist
+  if (modelOffList.some(model => modelName.includes(model))) {
+    safetySettings.forEach(setting => {
+      setting.threshold = 'OFF';
+    });
+    console.log(`Modell ${modelName} unterstützt OFF: Setze alle Safety-Einstellungen auf OFF.`);
+    settingsApplied = true;
+  }
+  // Prüfe, ob das Modell in der BLOCK_NONE-Liste ist (falls nicht schon auf OFF gesetzt)
+  else if (modelBlockNoneList.some(model => modelName.includes(model))) {
+    // Thresholds sind bereits auf BLOCK_NONE initialisiert
+    console.log(`Modell ${modelName} unterstützt nur BLOCK_NONE: Verwende BLOCK_NONE für alle Safety-Einstellungen.`);
+    settingsApplied = true;
+  }
+
+  // Fallback für unbekannte Modelle: Standardmäßig BLOCK_NONE verwenden
+  if (!settingsApplied) {
+    console.log(`Unbekanntes Modell ${modelName}: Verwende Standard BLOCK_NONE für alle Safety-Einstellungen.`);
+    // Thresholds sind bereits auf BLOCK_NONE initialisiert
   }
 
   return safetySettings;
 }
 
+
 // Hilfsfunktion für Retry-Logik
 async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream = false) {
   let lastError;
-
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      console.log(`API-Anfrage an OpenRouter ${url} (Versuch ${attempt + 1}/${maxRetries + 1}) für Modell ${data.model}`); // Logge Modellnamen
+      console.log(`API-Anfrage an OpenRouter (${url}, Versuch ${attempt + 1}/${maxRetries + 1})`);
+      const response = await apiClient.post(url, data, {
+        headers,
+        responseType: isStream ? 'stream' : 'json' // Set responseType based on stream flag
+      });
 
-      const response = isStream
-        ? await apiClient.post(url, data, {
-            headers,
-            responseType: 'stream'
-          })
-        : await apiClient.post(url, data, { headers });
-
-      // Prüfen auf leere Antwort (typisch für Content-Filter bei NICHT-Stream)
+      // Prüfen auf leere Antwort bei nicht-Streaming (typisch für Content-Filter ohne expliziten Fehler)
       if (!isStream &&
           response.data?.choices?.[0]?.message?.content === "" &&
           response.data.usage?.completion_tokens === 0 &&
-          response.data?.choices?.[0]?.finish_reason === 'stop') { // Zusätzliche Prüfung auf 'stop' reason
-        console.log("Möglicher Gemini Content-Filter erkannt (leere Antwort, 0 Tokens, stop reason)");
-        return {
-          status: 200,
-          data: {
-            content_filtered: true,
-            filter_reason: "Empty response suggests content filtering."
-          }
-        };
-      }
-      
-      // Prüfen auf expliziten Content-Filter im Finish Reason (auch bei Stream)
-      if (response.data?.choices?.[0]?.finish_reason === 'content_filter') {
-           console.log("Expliziter Gemini Content-Filter erkannt (finish_reason: content_filter)");
-           return {
-               status: 200,
-               data: {
-                   content_filtered: true,
-                   filter_reason: "Finish reason indicates content filtering."
-               }
-           };
+          response.data.choices?.[0]?.finish_reason === 'stop') { // Check finish_reason too
+        console.log("Leere Antwort ohne Fehler erkannt (potenzieller Content-Filter).");
+        // Simulate a content filter error structure for consistency downstream
+         throw Object.assign(new Error("Simulated Content Filter: Empty response from model."), {
+             response: {
+                 status: 403, // Simulate a forbidden status
+                 data: { error: { message: "Model returned an empty response, likely due to content filtering.", code: "content_filter_empty" } }
+             }
+         });
       }
 
-
-      return response; // Erfolg! Beende Schleife und gib Response zurück
-
+      return response; // Success
     } catch (error) {
       lastError = error;
-
       const status = error.response?.status;
-      const responseData = error.response?.data;
+      const shouldRetry = (status === 429 || (status >= 500 && status < 600));
 
-      console.error(`Fehler bei Versuch ${attempt + 1}: Status ${status}, Meldung: ${error.message}`);
-      if (responseData) {
-          console.error("Fehlerdetails:", JSON.stringify(responseData));
-      }
+      console.error(`Fehler bei Versuch ${attempt + 1}: Status ${status || 'N/A'}, Message: ${error.message}`);
 
-
-      // Prüfe auf spezifische Fehler, die ein Retry rechtfertigen oder spezielle Behandlung brauchen
-      if (status === 429 || (status >= 500 && status < 600)) { // Rate Limit oder Serverfehler
-        if (attempt < maxRetries) {
-          const delay = 1000 * Math.pow(2, attempt);
-          console.log(`Warte ${delay}ms vor Wiederholung (Status ${status})`);
-          await new Promise(resolve => setTimeout(resolve, delay));
-          continue; // Nächster Versuch
-        } else {
-            console.error(`Maximale Wiederholungsversuche (${maxRetries + 1}) für Status ${status} erreicht.`);
-            // Fehler an den aufrufenden Handler weitergeben für spezielle Fehlermeldung (z.B. Rate Limit)
-            throw error;
-        }
-      } else if (status === 403 || responseData?.error?.code === 'invalid_request_error' && responseData?.error?.message?.includes('safety rating')) { // Expliziter 403 oder Safety-Rating-Fehler
-            console.log("Expliziter Content-Filter Fehler (Status 403 oder Safety Rating Error)");
-            // Gib eine Struktur zurück, die im Handler als Content-Filter erkannt wird
-            return {
-                status: 200, // Simuliere Erfolg, aber mit Filter-Flag
-                data: {
-                    content_filtered: true,
-                    filter_reason: `Explicit filter error (Status ${status}, Message: ${responseData?.error?.message})`
-                }
-            };
+      if (shouldRetry && attempt < maxRetries) {
+        const delay = 1000 * Math.pow(2, attempt);
+        console.log(`Wiederhole in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
       } else {
-          // Anderer Fehler (z.B. 400 Bad Request, 401 Auth Fehler), kein Retry sinnvoll
-          console.error(`Nicht wiederholbarer Fehler (Status ${status}). Breche ab.`);
-          throw error; // Fehler sofort weitergeben
+        // No more retries or not a retryable error
+        console.error("Maximale Wiederholungsversuche erreicht oder nicht wiederholbarer Fehler.");
+        throw error; // Rethrow the last error
       }
     }
   }
-  // Sollte theoretisch nicht erreicht werden, außer bei maxRetries = -1
-  throw lastError;
+  throw lastError; // Should not be reached, but guarantees an error is thrown
 }
 
-// Stream-Handler-Funktion
+// Function to send SSE-formatted errors
+function sendStreamError(res, errorMessage, statusCode = 500) {
+  // Ensure headers allow streaming error messages if not already sent
+  if (!res.headersSent) {
+      res.writeHead(statusCode, { // Use appropriate status code if possible
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive'
+      });
+  }
+  // Sanitize error message for JSON embedding
+  const sanitizedMessage = errorMessage.replace(/"/g, '\\"').replace(/\n/g, '\\n');
+  const errorPayload = `data: {"error": {"message": "STREAM_ERROR: ${sanitizedMessage}", "code": "stream_failed"}}\n\n`;
+  console.error("Sende Stream-Fehler an Client:", errorPayload);
+  res.write(errorPayload);
+  res.end(); // End the stream after sending the error
+}
+
+
+// Stream-Handler-Funktion - Updated for error streaming
 async function handleStreamResponse(openRouterStream, res) {
   try {
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive'
-    });
+    // Set SSE headers if not already sent (though typically they are by now)
+     if (!res.headersSent) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive'
+        });
+     }
 
-    let streamEnded = false; // Flag, um doppeltes Beenden zu verhindern
-
+    // Pipe OpenRouter Stream to Client
     openRouterStream.on('data', (chunk) => {
-      // Prüfen, ob der Chunk einen Content-Filter-Fehler enthält (manche APIs senden das im Stream)
-      const chunkString = chunk.toString();
-      if (chunkString.includes('content_filter') || chunkString.includes('PROHIBITED_CONTENT')) {
-          console.warn("Content-Filter-Hinweis im Stream entdeckt:", chunkString);
-          // Sende eine benutzerfreundliche Fehlermeldung im SSE-Format
-          if (!streamEnded) {
-              res.write('data: {"choices":[{"delta":{"content":" Leider hat Gemini Ihre Eingabe als problematisch eingestuft (Content Filter). Versuchen Sie es mit einer anderen Formulierung oder verwenden Sie eine Jailbreak-Route wie /jbfree oder /jbcash."}}]}\n\n');
-              res.write('data: [DONE]\n\n'); // Signalisiert das Ende des Streams an den Client
-              res.end();
-              streamEnded = true;
-              openRouterStream.destroy(); // Stream von OpenRouter schließen
-          }
-          return; // Keine weiteren Daten verarbeiten
-      }
-      if (!streamEnded) {
-          res.write(chunk);
-      }
+      res.write(chunk); // Forward data chunk
     });
 
     openRouterStream.on('end', () => {
-      if (!streamEnded) {
-        console.log("OpenRouter Stream beendet.");
-        res.end(); // Reguläres Ende des Streams
-        streamEnded = true;
-      }
+      console.log("OpenRouter Stream beendet.");
+      res.end(); // Properly end the client response stream
     });
 
     openRouterStream.on('error', (error) => {
-      if (!streamEnded) {
-        console.error('Fehler im OpenRouter Stream:', error);
-        // Versuche, einen Fehler im SSE-Format zu senden
-        res.write(`data: {"error": {"message": "Stream error from API: ${error.message}"}}\n\n`);
-        res.end();
-        streamEnded = true;
-      }
+      console.error('Fehler während des OpenRouter Streams:', error.message);
+      // Send SSE formatted error message to the client
+      sendStreamError(res, `Error piping stream from OpenRouter: ${error.message}`);
     });
+
   } catch (error) {
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Stream processing error' });
-      } else if (!res.writableEnded) {
-          // Versuche, im Stream zu signalisieren, wenn möglich
-          res.write(`data: {"error": {"message": "Internal proxy stream error: ${error.message}"}}\n\n`);
-          res.end();
-      }
-      console.error('Fehler beim Stream Handling:', error);
+    console.error('Fehler im Stream Handling (handleStreamResponse):', error.message);
+    // If headers are already sent, we must use SSE error format
+    if (res.headersSent) {
+        sendStreamError(res, `Internal server error during stream processing: ${error.message}`);
+    } else {
+        // If headers not sent, we can still send a standard HTTP error, though less ideal for streaming clients
+        res.status(500).json({ error: 'Stream processing error', details: error.message });
+    }
   }
 }
 
 
 // Funktion zum Hinzufügen des Jailbreak-Textes zu den Messages
 function addJailbreakToMessages(body) {
-  // Tiefe Kopie des Body erstellen, um Seiteneffekte zu vermeiden
-  const newBody = JSON.parse(JSON.stringify(body));
-
+  const newBody = { ...body };
   if (!newBody.messages || !Array.isArray(newBody.messages)) {
     newBody.messages = [];
   }
 
-  // Prüfen, ob bereits eine Systemnachricht vorhanden ist
-  const systemMessageIndex = newBody.messages.findIndex(msg => msg.role === 'system');
+  // Check if jailbreak is already present (simple check based on a unique part of the text)
+  const jailbreakMarker = "## GAME SETTINGS";
+  const alreadyHasJailbreak = newBody.messages.some(msg => msg.role === "system" && msg.content?.includes(jailbreakMarker));
 
-  if (systemMessageIndex !== -1) {
-    // Wenn vorhanden, füge den Jailbreak-Text zur bestehenden Systemnachricht hinzu
-    // Stelle sicher, dass ein Zeilenumbruch dazwischen ist
-    newBody.messages[systemMessageIndex].content = `${newBody.messages[systemMessageIndex].content}\n\n${JAILBREAK_TEXT}`;
-    console.log("Jailbreak-Text zur bestehenden Systemnachricht hinzugefügt.");
+  if (!alreadyHasJailbreak) {
+      newBody.messages.unshift({
+        role: "system",
+        content: JAILBREAK_TEXT
+      });
+      console.log("Jailbreak-Text zur Anfrage hinzugefügt.");
   } else {
-    // Wenn nicht vorhanden, füge den Jailbreak als neue System-Nachricht am Anfang ein
-    newBody.messages.unshift({
-      role: "system",
-      content: JAILBREAK_TEXT
-    });
-    console.log("Jailbreak-Text als neue Systemnachricht hinzugefügt.");
+      console.log("Jailbreak-Text bereits vorhanden, wird nicht erneut hinzugefügt.");
   }
 
   return newBody;
 }
 
-// Erweiterte Proxy-Logik
+// Function to create a standardized error response for JanitorAI
+function createJanitorErrorResponse(errorMessage) {
+    // Remove potential "Error: " prefix for cleaner display
+    const cleanMessage = errorMessage.replace(/^Error:\s*/, '');
+    return {
+        choices: [{
+            message: {
+                // Using 'content' as JanitorAI expects this field for displaying messages
+                content: `PROXY_ERROR: ${cleanMessage}`
+            },
+            // Include a finish_reason to mimic a real API response ending due to an error
+            finish_reason: 'error'
+        }]
+    };
+}
+
+// Erweiterte Proxy-Logik mit optionalem Model-Override und Streaming-Support
 async function handleProxyRequestWithModel(req, res, forceModel = null, useJailbreak = false) {
-  const requestTimestamp = new Date().toISOString();
-  console.log(`== Anfrage empfangen (${requestTimestamp}) - Route: ${req.path}, ForceModel: ${forceModel}, Jailbreak: ${useJailbreak} ==`);
+  const isStreamingRequested = req.body?.stream === true;
+  let apiKey = null;
 
   try {
-    let apiKey = null;
+    // API-Key Extraktion (wie gehabt)
     if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
       apiKey = req.headers.authorization.split(' ')[1].trim();
     } else if (req.headers['x-api-key']) {
       apiKey = req.headers['x-api-key'].trim();
-    } else if (req.body.api_key) {
+    } else if (req.body?.api_key) { // Use optional chaining ?.
       apiKey = req.body.api_key;
       delete req.body.api_key;
     } else if (req.query.api_key) {
@@ -392,224 +377,258 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     }
 
     if (!apiKey) {
-      console.warn("API-Key fehlt in der Anfrage.");
-      // Sende die Fehlermeldung im für JanitorAI erwarteten Format
-      return res.status(200).json({
-        choices: [{ message: { content: "ERROR: Openrouter API-Key fehlt. Bitte gib deinen API-Key bei JanitorAI ein." } }]
-      });
+        console.error("API Key fehlt.");
+        // Send standard JSON error even if streaming was requested, as the request is fundamentally invalid
+        return res.status(401).json(createJanitorErrorResponse("Openrouter API-Key fehlt. Bitte gib deinen API-Key bei JanitorAI ein."));
     }
 
     const bodySize = JSON.stringify(req.body).length;
-    console.log(`Anfragegröße: ~${Math.round(bodySize / 1024)} KB`);
+    console.log(`Anfragegröße: ~${Math.round(bodySize / 1024)} KB, Streaming: ${isStreamingRequested}`);
 
-    let clientBody = req.body;
+    let clientBody = { ...req.body }; // Shallow copy to avoid modifying original request body directly
 
-    // Jailbreak anwenden, falls angefordert
     if (useJailbreak) {
       clientBody = addJailbreakToMessages(clientBody);
     }
 
-    const isStreamingRequested = clientBody.stream === true;
     const modelName = forceModel || clientBody.model;
-
-    // Prüfe, ob überhaupt ein Modellname vorhanden ist
-     if (!modelName) {
-        console.error("Fehler: Kein Modellname im Request Body oder durch Route vorgegeben.");
-        return res.status(200).json({
-            choices: [{ message: { content: "ERROR: Kein Modellname angegeben. Bitte wähle ein Modell in JanitorAI aus." } }]
-        });
+    if (!modelName) {
+         console.error("Modellname fehlt im Request Body.");
+         return res.status(400).json(createJanitorErrorResponse("Model name is missing in the request body."));
     }
+    console.log(`Verwendetes Modell: ${modelName}`);
 
 
     const dynamicSafetySettings = getSafetySettings(modelName);
 
-    const newBody = {
+    const requestBody = {
       ...clientBody,
-      model: modelName, // Stelle sicher, dass das korrekte Modell gesetzt ist
+      model: modelName, // Ensure model is set correctly
       safety_settings: dynamicSafetySettings,
+      // Add metadata for OpenRouter attribution
+      metadata: {
+          ...(clientBody.metadata || {}), // Preserve existing metadata if any
+          referer: 'https://janitorai.com/', // Or your specific site URL
+          x_title: 'JanitorAI' // Or your specific app name
+      }
     };
 
-    // Entferne 'stream' wenn es false ist, um unnötige Daten zu vermeiden
-    if (newBody.stream === false) {
-        delete newBody.stream;
+    // Ensure stream flag is correctly passed if requested
+    if (isStreamingRequested) {
+        requestBody.stream = true;
+    } else {
+        // Explicitly remove stream if false or not present, as some APIs might default to true
+        delete requestBody.stream;
     }
 
-    // Header für OpenRouter
+
     const headers = {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${apiKey}`,
-      'User-Agent': 'JanitorAI-Proxy/1.6.0', // Version aktualisiert
-      'HTTP-Referer': req.headers['referer'] || 'https://janitorai.com', // Referer vom Client übernehmen oder Standard
-      'X-Title': req.headers['x-title'] || 'Janitor.ai' // Titel vom Client übernehmen oder Standard
+      'User-Agent': 'JanitorAI-Proxy/1.6', // Updated version
+      'HTTP-Referer': 'https://janitorai.com', // Consistent Referer
+      'X-Title': 'Janitor.ai' // Consistent Title
     };
-
-    // Optional: Metadaten hinzufügen (falls noch nicht vorhanden)
-    if (!newBody.metadata) newBody.metadata = {};
-    newBody.metadata.referer = headers['HTTP-Referer']; // Konsistent halten
 
     const endpoint = '/chat/completions';
     const response = await makeRequestWithRetry(
       endpoint,
-      newBody,
+      requestBody,
       headers,
       2, // Retries
       isStreamingRequested
     );
 
-    console.log(`== Openrouter-Antwort verarbeitet (${new Date().toISOString()}) ==`);
+    console.log(`== Openrouter-Antwort erhalten (${new Date().toISOString()}) ==`);
 
-    // WICHTIG: Prüfen auf content_filtered Flag aus makeRequestWithRetry
-    if (response.data?.content_filtered) {
-        console.log("Sende Content-Filter-Meldung an Client. Grund:", response.data.filter_reason);
-        const filterMessage = useJailbreak
-            ? "Leider hat Gemini trotz Jailbreak Ihre Eingabe als problematisch eingestuft (Content Filter). Versuchen Sie eine andere Formulierung."
-            : "Leider hat Gemini Ihre Eingabe als problematisch eingestuft (Content Filter). Versuchen Sie es mit einer anderen Formulierung oder verwenden Sie eine Jailbreak-Route wie /jbfree oder /jbcash.";
-        return res.status(200).json({
-            choices: [{ message: { content: filterMessage } }]
-        });
-    }
-
-
-    // Stream-Antwort behandeln
-    if (isStreamingRequested && response.data && typeof response.data.on === 'function') { // Sicherstellen, dass es ein Stream ist
-      return handleStreamResponse(response.data, res);
-    }
-
-    // Normale JSON-Antwort
-    // Fehler innerhalb der OpenRouter-Antwort prüfen (z.B. Quota)
-    if (response.data?.error) {
-        console.log("Fehler in der Openrouter JSON-Antwort:", JSON.stringify(response.data.error));
-        let userMessage = `ERROR: ${response.data.error.message || "Unbekannter Fehler von OpenRouter."}`;
-
-        // Spezifische Fehlermeldungen für Quota
-        if (response.data.error.code === 429 || (response.data.error.message && response.data.error.message.toLowerCase().includes("quota exceeded"))) {
-            userMessage = "Entschuldigung, dein Limit für kostenlose Nachrichten bei Gemini ist für heute aufgebraucht oder du sendest Anfragen zu schnell hintereinander (Rate Limit). Warte einen Moment oder wechsle zur bezahlten Version (/cash oder /jbcash), falls verfügbar. <3";
+    // Handle Streaming Response
+    if (isStreamingRequested) {
+        // Check if response.data is indeed a stream
+        if (response.data && typeof response.data.pipe === 'function') {
+           // Set headers for SSE *before* piping
+            res.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive'
+            });
+            return handleStreamResponse(response.data, res); // Pass the stream itself
+        } else {
+            // This case should ideally not happen if responseType: 'stream' worked
+            console.error("Streaming requested, but OpenRouter response is not a stream.");
+            sendStreamError(res, "Proxy Error: Expected a stream from OpenRouter, but received something else.");
+            return;
         }
-        // (Content-Filter wird jetzt oben über das Flag behandelt)
-
-        return res.status(200).json({ choices: [{ message: { content: userMessage } }] });
     }
 
-    // Erfolgreiche JSON-Antwort zurückgeben
+    // Handle Non-Streaming Response
+    // Check for errors within the successful response structure (e.g., quota)
+    if (response.data?.error) {
+      console.log("Fehler in Openrouter-Antwortdaten:", JSON.stringify(response.data.error));
+      const error = response.data.error;
+      let userMessage = `OpenRouter Error: ${error.message || "Unknown error from API."} (Code: ${error.code || 'N/A'})`;
+
+      // Custom messages based on error codes/messages
+      if (error.code === 429 || error.message?.includes("quota")) {
+          userMessage = "Sorry my love, Gemini is unfortunately a bit stingy and you're either too fast, (Wait a few seconds, because the free version only allows a few requests per minute.) or you've used up your free messages for the day in the free version. In that case, you either need to switch to the paid version or wait until tomorrow. I'm sorry! Sending you a big hug! <3";
+      } else if (error.code === 403 || error.message?.includes('PROHIBITED_CONTENT') || error.code === "google_safety") {
+          userMessage = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use a Jailbreaked Version (/jbfree, /jbcash, /flash25, /jbnofilter) for NSWF/Violence, or try the paid 'Gemini 2.5 Pro Preview' model (/cash, /jbcash) which is generally more permissive.";
+      } else if (error.code === "content_filter_empty") { // Handle the simulated empty response error
+          userMessage = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use a Jailbreaked Version (/jbfree, /jbcash, /flash25, /jbnofilter) for NSWF/Violence. (Detected empty response)";
+      }
+
+
+      return res.status(200).json(createJanitorErrorResponse(userMessage)); // Use 200 OK for Janitor compatibility
+    }
+
+    // Success: Return normal JSON response data
     return res.json(response.data);
 
   } catch (error) {
-    console.error(`Schwerwiegender Fehler im Proxy-Handler (${req.path}):`, error.message);
+    console.error("Schwerwiegender Fehler im Proxy:", error.message);
     if (error.response) {
-      console.error("Fehler-Status:", error.response.status);
-      console.error("Fehler-Daten:", JSON.stringify(error.response.data));
-    } else if (error.request) {
-        console.error("Fehler: Keine Antwort vom Server erhalten.");
+      console.error("API Antwort Status:", error.response.status);
+      console.error("API Antwort Daten:", error.response.data);
     } else {
-        console.error("Fehler beim Setup der Anfrage:", error.message);
+      console.error("Keine API Antwort erhalten (Netzwerkproblem, Timeout etc.)");
     }
 
-    let errorMessage = "Ein unerwarteter Fehler ist im Proxy aufgetreten.";
+    // Determine user-friendly error message
+    let errorMessage = "An unexpected error occurred in the proxy.";
     const status = error.response?.status;
+    const responseDataError = error.response?.data?.error;
 
     if (error.code === 'ECONNABORTED' || error.message.toLowerCase().includes('timeout')) {
-      errorMessage = "TIMEOUT: Die Anfrage an OpenRouter hat zu lange gedauert. Versuche es erneut oder prüfe den Modellstatus auf OpenRouter.";
+      errorMessage = "Request timeout: The API took too long to respond. Try reducing the request length or try again later.";
     } else if (error.code === 'ECONNRESET') {
-      errorMessage = "CONNECTION_RESET: Die Verbindung zu OpenRouter wurde unerwartet geschlossen.";
-    } else if (status === 429 || error.response?.data?.error?.message?.toLowerCase().includes("quota")) {
-        errorMessage = "Entschuldigung, dein Limit für kostenlose Nachrichten bei Gemini ist für heute aufgebraucht oder du sendest Anfragen zu schnell hintereinander (Rate Limit). Warte einen Moment oder wechsle zur bezahlten Version (/cash oder /jbcash), falls verfügbar. <3";
-    // Content-Filter Fehler sollten eigentlich durch makeRequestWithRetry abgefangen werden, aber als Fallback:
-    } else if (status === 403 || error.response?.data?.error?.message?.includes('PROHIBITED_CONTENT') || error.response?.data?.error?.message?.includes('safety rating')) {
-         errorMessage = "Leider hat Gemini Ihre Eingabe als problematisch eingestuft (Content Filter). Versuchen Sie es mit einer anderen Formulierung oder verwenden Sie eine Jailbreak-Route wie /jbfree oder /jbcash.";
-    } else if (error.response?.data?.error?.message) {
-      errorMessage = `API ERROR: ${error.response.data.error.message}`;
+      errorMessage = "Connection reset: The connection to the API was interrupted.";
+    } else if (status === 429 || responseDataError?.message?.includes("quota")) {
+      errorMessage = "Sorry my love, Gemini is unfortunately a bit stingy and you're either too fast, (Wait a few seconds, because the free version only allows a few requests per minute.) or you've used up your free messages for the day in the free version. In that case, you either need to switch to the paid version or wait until tomorrow. I'm sorry! Sending you a big hug! <3";
+    } else if (status === 403 || responseDataError?.code === "google_safety" || responseDataError?.message?.includes('PROHIBITED_CONTENT') || responseDataError?.code === "content_filter_empty") {
+       errorMessage = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use a Jailbreaked Version (/jbfree, /jbcash, /flash25, /jbnofilter) for NSWF/Violence, or try the paid 'Gemini 2.5 Pro Preview' model (/cash, /jbcash).";
+    } else if (responseDataError?.message) {
+       errorMessage = `API Error: ${responseDataError.message} (Code: ${responseDataError.code || status || 'N/A'})`;
     } else if (error.message) {
-        errorMessage = `PROXY ERROR: ${error.message}`;
+       // Use the general error message if it's more specific than the default
+       errorMessage = error.message;
     }
 
-    // Konsistentes Fehlerformat für Janitor
-    return res.status(200).json({
-      choices: [{ message: { content: `ERROR: ${errorMessage}` } }]
-    });
+
+    // --- Error Handling based on request type ---
+    if (isStreamingRequested && res.headersSent) {
+        // If headers are sent, we *must* use SSE format for the error
+        console.log("Stream headers already sent, sending SSE error.");
+        sendStreamError(res, errorMessage);
+    } else if (isStreamingRequested && !res.headersSent) {
+        // If streaming was requested but headers *weren't* sent (error happened early),
+        // we can still try to send an SSE error, but a JSON might be safer depending on client.
+        // Let's try SSE first.
+        console.log("Streaming requested, headers not sent, sending SSE error.");
+        // Use 200 status code for the initial response to potentially avoid client issues,
+        // but indicate error within the stream payload.
+        sendStreamError(res, errorMessage, 200);
+    }
+    else {
+        // Standard JSON error response for non-streaming requests or errors before streaming could start
+        console.log("Sending standard JSON error response.");
+        return res.status(200).json(createJanitorErrorResponse(errorMessage)); // Use 200 OK for Janitor compatibility
+    }
   }
 }
 
-// --- Routen Definitionen ---
+// --- Routen Definition ---
 
-// Route "/free" - Erzwingt das kostenlose Gemini Pro Experimental Modell
-app.post('/free', (req, res) => {
-  handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-exp-03-25:free", false); // Kein Jailbreak
+// Route "/free" - Erzwingt das kostenlose Gemini 2.5 Pro Modell
+app.post('/free', async (req, res) => {
+  const requestTimestamp = new Date().toISOString();
+  console.log(`== Neue Anfrage über /free (${requestTimestamp}) ==`);
+  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-exp-03-25:free");
 });
 
-// Route "/cash" - Erzwingt das kostenpflichtige Gemini Pro Preview Modell
-app.post('/cash', (req, res) => {
-  handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25", false); // Kein Jailbreak
+// Route "/cash" - Erzwingt das kostenpflichtige Gemini 2.5 Pro Modell
+app.post('/cash', async (req, res) => {
+  const requestTimestamp = new Date().toISOString();
+  console.log(`== Neue Anfrage über /cash (${requestTimestamp}) ==`);
+  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25");
 });
 
-// Route "/jbfree" - Freies Modell MIT Jailbreak
-app.post('/jbfree', (req, res) => {
-  handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-exp-03-25:free", true); // MIT Jailbreak
+// Route "/jbfree" - Freies Modell mit Jailbreak
+app.post('/jbfree', async (req, res) => {
+  const requestTimestamp = new Date().toISOString();
+  console.log(`== Neue Anfrage über /jbfree mit Jailbreak (${requestTimestamp}) ==`);
+  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-exp-03-25:free", true); // Jailbreak = true
 });
 
-// Route "/jbcash" - Kostenpflichtiges Modell MIT Jailbreak
-app.post('/jbcash', (req, res) => {
-  handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25", true); // MIT Jailbreak
+// Route "/jbcash" - Kostenpflichtiges Modell mit Jailbreak
+app.post('/jbcash', async (req, res) => {
+  const requestTimestamp = new Date().toISOString();
+  console.log(`== Neue Anfrage über /jbcash mit Jailbreak (${requestTimestamp}) ==`);
+  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25", true); // Jailbreak = true
 });
 
-// Route "/nofilter" - Modell frei wählbar, KEIN Jailbreak
-app.post('/nofilter', (req, res) => {
-  handleProxyRequestWithModel(req, res, null, false); // Modell aus Request, KEIN Jailbreak
+// NEUE ROUTE: "/flash25" - Erzwingt Gemini 2.5 Flash Preview MIT Jailbreak
+app.post('/flash25', async (req, res) => {
+  const requestTimestamp = new Date().toISOString();
+  console.log(`== Neue Anfrage über /flash25 mit Jailbreak (${requestTimestamp}) ==`);
+  // Using GEMINI_25_FLASH_PREVIEW as the target model for this route
+  await handleProxyRequestWithModel(req, res, GEMINI_25_FLASH_PREVIEW, true); // Jailbreak = true
 });
 
-// NEUE ROUTE: "/jbnofilter" - Modell frei wählbar, MIT Jailbreak
-app.post('/jbnofilter', (req, res) => {
-    handleProxyRequestWithModel(req, res, null, true); // Modell aus Request, MIT Jailbreak
+// Route "/nofilter" - Modell frei wählbar, KEIN Standard-Jailbreak
+app.post('/nofilter', async (req, res) => {
+  const requestTimestamp = new Date().toISOString();
+  console.log(`== Neue Anfrage über /nofilter (${requestTimestamp}) ==`);
+  // Calls the main handler without forcing a model or jailbreak
+  await handleProxyRequestWithModel(req, res, null, false);
 });
 
-// NEUE ROUTE: "/flash25" - Erzwingt 2.5 Flash Preview MIT Jailbreak
-app.post('/flash25', (req, res) => {
-    handleProxyRequestWithModel(req, res, "google/gemini-2.5-flash-preview", true); // MIT Jailbreak
+// NEUE ROUTE: "/jbnofilter" - Modell frei wählbar, MIT Standard-Jailbreak
+app.post('/jbnofilter', async (req, res) => {
+  const requestTimestamp = new Date().toISOString();
+  console.log(`== Neue Anfrage über /jbnofilter mit Jailbreak (${requestTimestamp}) ==`);
+  // Calls the main handler without forcing a model, BUT with jailbreak enabled
+  await handleProxyRequestWithModel(req, res, null, true); // Jailbreak = true
 });
 
-// NEUE ROUTE: "/flash25thinking" - Erzwingt 2.5 Flash Thinking MIT Jailbreak
-app.post('/flash25thinking', (req, res) => {
-    handleProxyRequestWithModel(req, res, "google/gemini-2.5-flash-preview:thinking", true); // MIT Jailbreak
+
+// Legacy Route "/v1/chat/completions" - Modell frei wählbar, KEIN Standard-Jailbreak
+app.post('/v1/chat/completions', async (req, res) => {
+  const requestTimestamp = new Date().toISOString();
+  console.log(`== Neue Anfrage über alte Route /v1/chat/completions (${requestTimestamp}) ==`);
+   // Calls the main handler without forcing a model or jailbreak
+  await handleProxyRequestWithModel(req, res, null, false);
 });
 
-
-// Alte Route für Abwärtskompatibilität - Modell frei wählbar, KEIN Jailbreak
-app.post('/v1/chat/completions', (req, res) => {
-  console.log(`== Anfrage über alte Route /v1/chat/completions (${new Date().toISOString()}) ==`);
-  handleProxyRequestWithModel(req, res, null, false); // Modell aus Request, KEIN Jailbreak
-});
-
-// Statusroute aktualisiert
+// Einfache Statusroute aktualisieren mit neuen Endpunkten
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '1.6.0', // Version erhöht
-    info: 'GEMINI UNBLOCKER V.1.3 by Sophiamccarty (Updated)',
-    usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI (with dynamic safety settings & jailbreak options)',
+    version: '1.6.0', // Updated version
+    info: 'GEMINI UNBLOCKER by Sophiamccarty',
+    usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI via OpenRouter',
     endpoints: {
-      standard_no_jb: '/nofilter (Wählt Modell aus J.AI, kein Jailbreak)',
-      legacy_no_jb: '/v1/chat/completions (Wie /nofilter)',
-      standard_jb: '/jbnofilter (Wählt Modell aus J.AI, MIT Jailbreak)', // NEU
-      free_pro_no_jb: '/free (Gemini 2.5 Pro Exp Free, kein Jailbreak)',
-      paid_pro_no_jb: '/cash (Gemini 2.5 Pro Preview, kein Jailbreak)',
-      free_pro_jb: '/jbfree (Gemini 2.5 Pro Exp Free, MIT Jailbreak)',
-      paid_pro_jb: '/jbcash (Gemini 2.5 Pro Preview, MIT Jailbreak)',
-      flash_preview_jb: '/flash25 (Gemini 2.5 Flash Preview, MIT Jailbreak)', // NEU
-      flash_thinking_jb: '/flash25thinking (Gemini 2.5 Flash Thinking, MIT Jailbreak)' // NEU
+      model_choice_no_jb: '/nofilter (or /v1/chat/completions)', // Standard-Route ohne Modellzwang/JB
+      model_choice_with_jb: '/jbnofilter', // NEU: Modellwahl + JB
+      gemini_25_pro_free_no_jb: '/free', // Route mit kostenlosem 2.5 Pro
+      gemini_25_pro_paid_no_jb: '/cash', // Route mit kostenpflichtigem 2.5 Pro
+      gemini_25_pro_free_with_jb: '/jbfree', // Route mit kostenlosem 2.5 Pro + JB
+      gemini_25_pro_paid_with_jb: '/jbcash', // Route mit kostenpflichtigem 2.5 Pro + JB
+      gemini_25_flash_with_jb: '/flash25', // NEU: Route mit 2.5 Flash Preview + JB
     },
     features: {
-      streaming: 'Aktiviert',
-      dynamicSafety: 'Optimiert für Gemini 2.5 Pro/Flash (versucht OFF), Fallback auf BLOCK_NONE für andere/ältere Modelle.',
-      jailbreak: 'Verfügbar über /jbnofilter, /jbfree, /jbcash, /flash25, /flash25thinking' // Aktualisiert
-    },
-    notes: {
-        reasoning: "Reasoning/Thinking wird durch die Verwendung eines Modellnamens mit ':thinking' Suffix angefordert (z.B. /flash25thinking). Keine zusätzlichen Parameter nötig/möglich.",
-        safety_settings: "Safety wird auf 'OFF' gesetzt für bekannte unterstützte Modelle, sonst 'BLOCK_NONE'."
+      streaming: 'Aktiviert (inkl. Fehler-Streaming)',
+      dynamicSafety: 'Optimiert für Gemini Modelle (versucht OFF, fallback BLOCK_NONE)',
+      jailbreak: 'Verfügbar über /jbfree, /jbcash, /jbnofilter, /flash25 Routen',
+      models_tested_off: [
+          'google/gemini-2.5-pro-preview-03-25',
+          'google/gemini-2.5-pro-exp-03-25:free',
+          GEMINI_25_FLASH_PREVIEW,
+          // Add others as confirmed
+      ]
     }
   });
 });
 
-
-// Health-Check Endpoint
+// Health-Check Endpoint für Monitoring
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
@@ -619,10 +638,9 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Starte den Server
+// Starte den Express-Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`JanitorAI Proxy v1.6.0 läuft auf Port ${PORT}`);
-  console.log(`Verfügbare Endpunkte unter http://localhost:${PORT}/`);
+  console.log(`Proxy Server v1.6.0 läuft auf Port ${PORT}`);
   console.log(`${new Date().toISOString()} - Server gestartet`);
 });

@@ -31,7 +31,7 @@ app.use((req, res, next) => {
 const apiClient = axios.create({
   httpAgent: new http.Agent({ keepAlive: true, maxSockets: 100 }),
   httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 100 }),
-  timeout: 90000, // Timeout auf 90 Sekunden erhöht (statt 60 Sekunden)
+  timeout: 45000, // Timeout auf 90 Sekunden erhöht (statt 60 Sekunden)
   baseURL: 'https://openrouter.ai/api/v1'
 });
 

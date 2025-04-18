@@ -21,11 +21,14 @@ const CONFIG = {
   TIMEOUT: {
     REQUEST: 45000,        // 45 Sekunden Timeout für normale Anfragen
     STREAM: 5 * 60 * 1000, // 5 Minuten Timeout für Streams
-    SERVER: 120000         // 2 Minuten Server-Timeout
+    SERVER: 120000,        // 2 Minuten Server-Timeout
+    INACTIVITY: 30000,     // 30 Sekunden Inaktivitäts-Timeout
+    HEARTBEAT: 15000       // 15 Sekunden Heartbeat-Intervall
   },
   MAX_RETRIES: 2,
   THINKING_BUDGET: 8192,
-  FLASH_MAX_TOKENS: 1024
+  FLASH_MAX_TOKENS: 1024,
+  VERSION: '2.7.0'
 };
 
 // Standardisierte Fehlermeldungen
@@ -38,7 +41,8 @@ const ERROR_MESSAGES = {
   CONNECTION_TIMEOUT: "Connection timeout: The API didn't respond in time",
   STREAM_TIMEOUT: "Stream timeout reached",
   UNKNOWN_ERROR: "Unknown error from provider",
-  EMPTY_RESPONSE: "The AI provider returned an empty response."
+  EMPTY_RESPONSE: "The AI provider returned an empty response.",
+  PGSHAG2_ERROR: "The model was unable to provide a complete response due to safety constraints. Try using the jailbreak version instead."
 };
 
 // Axios-Instance mit Connection Pooling und Timeout
@@ -479,6 +483,82 @@ function extractReasoningTokens(data) {
     (data.usage && data.usage.prompt_tokens) || 0;
 }
 
+// Verbesserte Fehlererkennung bei Stream-Antworten
+function isStreamError(chunkStr) {
+  // Prüfen auf explizite Fehlermeldungen
+  if (chunkStr.includes('"error"')) {
+    return true;
+  }
+  
+  // Prüfen auf leere Chunks oder ungültige Formate
+  if (chunkStr.trim() === '' || 
+      (chunkStr.includes('data:') && chunkStr.trim() === 'data:')) {
+    return true;
+  }
+  
+  // Spezifische OpenRouter-Fehlercodes überprüfen
+  if (chunkStr.includes('"code":') && 
+      (chunkStr.includes('"code": 429') || 
+       chunkStr.includes('"code": 500') || 
+       chunkStr.includes('"code": 503'))) {
+    return true;
+  }
+  
+  // Prüfen auf pgshag2-spezifischen Fehler
+  if (chunkStr.includes('pgshag2') || 
+      chunkStr.includes('safety_settings') ||
+      chunkStr.includes('PROHIBITED_CONTENT')) {
+    return true;
+  }
+  
+  return false;
+}
+
+// Funktion zum Extrahieren der Fehlermeldung aus dem Stream-Chunk
+function extractErrorFromChunk(chunkStr) {
+  // Standardfehlermeldung
+  let errorMessage = ERROR_MESSAGES.UNKNOWN_ERROR;
+  
+  try {
+    // Prüfen auf pgshag2 Fehler
+    if (chunkStr.includes('pgshag2')) {
+      return ERROR_MESSAGES.PGSHAG2_ERROR;
+    }
+    
+    // Prüfen auf PROHIBITED_CONTENT
+    if (chunkStr.includes('PROHIBITED_CONTENT')) {
+      return ERROR_MESSAGES.CONTENT_FILTERED;
+    }
+    
+    // Versuche, einen JSON-Teil zu extrahieren
+    const jsonMatches = chunkStr.match(/data: ({.*})/);
+    if (jsonMatches && jsonMatches[1]) {
+      const jsonData = JSON.parse(jsonMatches[1]);
+      
+      // Prüfe verschiedene mögliche Fehlerpfade
+      if (jsonData.error && jsonData.error.message) {
+        errorMessage = jsonData.error.message;
+      } else if (jsonData.message) {
+        errorMessage = jsonData.message;
+      } else if (jsonData.detail) {
+        errorMessage = jsonData.detail;
+      }
+      
+      // Prüfe auf spezifische Fehlercodes
+      if (jsonData.code === 429) {
+        return ERROR_MESSAGES.QUOTA_EXCEEDED;
+      } else if (jsonData.code === 403) {
+        return ERROR_MESSAGES.CONTENT_FILTERED;
+      }
+    }
+  } catch (parseError) {
+    // Bei Parsing-Fehlern verwenden wir eine sinnvolle Fallback-Meldung
+    console.log(`Fehler beim Parsen der Fehlermeldung: ${parseError.message}`);
+  }
+  
+  return errorMessage;
+}
+
 // Hilfsfunktion für Retry-Logik mit verbesserter Stream-Erkennung
 async function makeRequestWithRetry(url, data, headers, maxRetries = CONFIG.MAX_RETRIES, isStream = false) {
   let lastError;
@@ -557,11 +637,15 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = CONFIG.MAX_
   throw lastError;
 }
 
-// Stream-Handler-Funktion mit verbesserter Fehler- und Timeout-Behandlung
+// Stream-Handler-Funktion mit robusterer Fehler- und Datenverarbeitung
 function handleStreamResponse(openRouterStream, res, modelName = "", requestConfig = {}) {
   let streamHasData = false;
   let reasoningInfo = null;
   let streamFinished = false;
+  let responseData = []; // Sammelt alle empfangenen Chunks
+  let lastChunkTime = Date.now();
+  let isFirstChunk = true;
+  let hasSentContent = false;
   
   try {
     // SSE Header setzen
@@ -571,36 +655,64 @@ function handleStreamResponse(openRouterStream, res, modelName = "", requestConf
       'Connection': 'keep-alive'
     });
 
+    // Heartbeat senden, um die Verbindung offen zu halten
+    const heartbeatInterval = setInterval(() => {
+      // Nur Heartbeat senden wenn Stream noch nicht fertig
+      if (!streamFinished) {
+        // Kommentar senden, der vom Client ignoriert wird
+        res.write(": heartbeat\n\n");
+        console.log("Heartbeat gesendet um Verbindung aufrechtzuerhalten");
+      } else {
+        clearInterval(heartbeatInterval);
+      }
+    }, CONFIG.TIMEOUT.HEARTBEAT);
+
     // OpenRouter Stream an Client weiterleiten
     openRouterStream.on('data', (chunk) => {
       try {
-        const chunkStr = chunk.toString();
-        streamHasData = true;
+        // Timestamp der letzten Chunk-Empfangszeit aktualisieren
+        lastChunkTime = Date.now();
         
-        // Fehlerprüfung
-        if (chunkStr.includes('"error"')) {
-          let errorMessage = ERROR_MESSAGES.UNKNOWN_ERROR;
+        const chunkStr = chunk.toString();
+        responseData.push(chunkStr); // Chunk für eventuelles Debugging speichern
+        
+        // Debug-Log für den ersten Chunk
+        if (isFirstChunk) {
+          console.log(`Erster Stream-Chunk empfangen: ${chunkStr.substring(0, 100)}...`);
+          isFirstChunk = false;
+        }
+        
+        // Fehlerprüfung mit verbesserter Erkennung
+        if (isStreamError(chunkStr)) {
+          let errorMessage = extractErrorFromChunk(chunkStr);
           
-          try {
-            // Versuche detaillierte Fehlermeldung zu extrahieren
-            const jsonMatches = chunkStr.match(/data: ({.*})/);
-            if (jsonMatches && jsonMatches[1]) {
-              const jsonData = JSON.parse(jsonMatches[1]);
-              if (jsonData.error && jsonData.error.message) {
-                errorMessage = jsonData.error.message;
-              }
-            }
-          } catch (parseError) {
-            // Ignoriere Parsing-Fehler, verwende Standard-Fehlermeldung
+          console.log(`Stream-Fehler erkannt: ${errorMessage}`);
+          
+          // Wenn wir bereits Inhalte gesendet haben, senden wir das DONE direkt
+          if (hasSentContent) {
+            res.write('data: [DONE]\n\n');
+          } else {
+            res.write(createStreamErrorMessage(errorMessage));
           }
           
-          res.write(createStreamErrorMessage(errorMessage));
+          clearInterval(heartbeatInterval);
           openRouterStream.destroy();
           res.end();
           
           streamFinished = true;
+          logResponseStatus(false, 0, errorMessage);
           finalizeRequestLog();
           return;
+        }
+        
+        // Setze Flag wenn wir Daten bekommen haben
+        if (!streamHasData && chunkStr.trim().length > 0) {
+          streamHasData = true;
+        }
+        
+        // Wenn der Chunk tatsächliche Inhalte enthält, setzen wir das Content-Flag
+        if (chunkStr.includes('"content"') && !chunkStr.includes('"content":""')) {
+          hasSentContent = true;
         }
         
         // Versuche, Reasoning-Informationen aus dem Stream zu extrahieren
@@ -621,25 +733,50 @@ function handleStreamResponse(openRouterStream, res, modelName = "", requestConf
                   tokens: reasoningTokens,
                   budget: requestConfig.thinkingConfig?.thinkingBudget || CONFIG.THINKING_BUDGET
                 };
+                
+                // Logge direkt, damit wir es auch bei vorzeitigem Ende haben
+                if (supportsThinking(modelName)) {
+                  logThinkingStatus(true, reasoningTokens, '', reasoningInfo.budget);
+                }
+              }
+              
+              // Prüfe auf completion_tokens/native_tokens_completion
+              const completionTokens = jsonData.native_tokens_completion || 
+                                     (jsonData.usage && jsonData.usage.completion_tokens) || 0;
+              
+              if (completionTokens > 0) {
+                // Wir haben eine Completion erhalten
+                console.log(`Stream-Completion: ${completionTokens} Tokens generiert`);
               }
             }
           } catch (jsonError) {
-            // Ignoriere JSON-Parsing-Fehler
+            console.log(`JSON-Parsing-Fehler bei Metadata: ${jsonError.message}`);
           }
         }
         
+        // Immer den Chunk an den Client senden
         res.write(chunk);
+        
       } catch (err) {
-        console.error("Error processing stream chunk:", err);
+        console.error(`Error processing stream chunk: ${err.message}`);
+        // Fehler beim Verarbeiten eines Chunks soll nicht den Stream abbrechen
       }
     });
 
     // Normale Stream-Ende-Behandlung
     openRouterStream.on('end', () => {
+      clearInterval(heartbeatInterval);
+      
+      console.log("Stream-Ende erreicht");
+      
       if (!streamHasData) {
+        console.log("Stream endete ohne Daten");
         res.write(createStreamErrorMessage(ERROR_MESSAGES.EMPTY_RESPONSE));
+      } else {
+        console.log(`Stream erfolgreich beendet mit ${responseData.length} Chunks`);
       }
       
+      // Sicherstellen, dass wir DONE senden
       res.write('data: [DONE]\n\n');
       res.end();
       
@@ -648,36 +785,148 @@ function handleStreamResponse(openRouterStream, res, modelName = "", requestConf
         logThinkingStatus(true, reasoningInfo.tokens, '', reasoningInfo.budget);
       }
       
+      // Antwort an JanitorAI erfolgreich, Token-Anzahl schätzen
+      let responseTokens = 0;
+      // Versuchen, aus responseData eine Tokenanzahl zu extrahieren
+      try {
+        const fullResponse = responseData.join('');
+        // Suchen nach completion_tokens in der Antwort
+        const tokenMatch = fullResponse.match(/"(native_tokens_completion|completion_tokens)":\s*(\d+)/);
+        if (tokenMatch && tokenMatch[2]) {
+          responseTokens = parseInt(tokenMatch[2], 10);
+        } else {
+          // Fallback: Tokenzahl aus Textlänge schätzen
+          responseTokens = estimateTokens(fullResponse);
+        }
+      } catch (err) {
+        // Ignorieren, verwende Standardwert
+      }
+      
+      logResponseStatus(true, responseTokens);
+      
       streamFinished = true;
       finalizeRequestLog();
     });
 
     // Fehlerbehandlung für den Stream
     openRouterStream.on('error', (error) => {
-      console.error("Stream error:", error.message);
-      res.write(createStreamErrorMessage("Error: " + error.message));
+      clearInterval(heartbeatInterval);
+      
+      console.error(`Stream error: ${error.message}`);
+      
+      // Versuchen zu retten, falls wir bereits einige Daten haben
+      if (hasSentContent) {
+        console.log("Stream-Fehler, aber Content wurde bereits gesendet. Beende mit DONE.");
+        res.write('data: [DONE]\n\n');
+      } else if (streamHasData) {
+        console.log("Stream-Fehler mit Daten ohne Content. Fallback auf pgshag2-Fehler.");
+        res.write(createStreamErrorMessage(ERROR_MESSAGES.PGSHAG2_ERROR));
+      } else {
+        console.log("Stream-Fehler ohne Daten. Sende Fehlermeldung.");
+        res.write(createStreamErrorMessage(`Error: ${error.message}`));
+      }
+      
       res.end();
+      logResponseStatus(false, 0, `Stream-Fehler: ${error.message}`);
       
       streamFinished = true;
       finalizeRequestLog();
     });
     
-    // Sicherheits-Timeout für den Stream
+    // Inaktivitäts-Timeout - wenn für längere Zeit keine Chunks empfangen werden
+    const inactivityCheckInterval = setInterval(() => {
+      const inactiveTime = Date.now() - lastChunkTime;
+      
+      // Wenn keine Aktivität für X Sekunden und der Stream noch nicht beendet ist
+      if (inactiveTime > CONFIG.TIMEOUT.INACTIVITY && !streamFinished) {
+        console.log(`Stream-Inaktivität erkannt (${inactiveTime/1000}s). Prüfe Status...`);
+        
+        // Wenn wir bereits Inhalte haben, ist das vielleicht ein normales Ende, das nicht richtig signalisiert wurde
+        if (hasSentContent) {
+          console.log("Stream inaktiv, aber Content wurde empfangen. Beende mit DONE.");
+          clearInterval(inactivityCheckInterval);
+          clearInterval(heartbeatInterval);
+          
+          res.write('data: [DONE]\n\n');
+          res.end();
+          
+          // Antwortstatus aktualisieren
+          let responseTokens = 0;
+          try {
+            const fullResponse = responseData.join('');
+            const tokenMatch = fullResponse.match(/"(native_tokens_completion|completion_tokens)":\s*(\d+)/);
+            if (tokenMatch && tokenMatch[2]) {
+              responseTokens = parseInt(tokenMatch[2], 10);
+            } else {
+              responseTokens = estimateTokens(fullResponse);
+            }
+          } catch (err) {
+            // Ignorieren
+          }
+          
+          logResponseStatus(true, responseTokens);
+          
+          streamFinished = true;
+          finalizeRequestLog();
+        } 
+        // Wenn wir Daten haben aber keine Inhalte, könnte ein Content-Filter aktiv sein
+        else if (streamHasData && !hasSentContent) {
+          console.log("Stream inaktiv, Daten ohne Content. Möglicher Safety-Filter. Beende mit pgshag2-Fehler.");
+          clearInterval(inactivityCheckInterval);
+          clearInterval(heartbeatInterval);
+          
+          res.write(createStreamErrorMessage(ERROR_MESSAGES.PGSHAG2_ERROR));
+          res.end();
+          
+          logResponseStatus(false, 0, ERROR_MESSAGES.PGSHAG2_ERROR);
+          
+          streamFinished = true;
+          finalizeRequestLog();
+        }
+      }
+    }, 5000);  // Alle 5 Sekunden prüfen
+    
+    // Haupttimeout für den gesamten Stream
     setTimeout(() => {
       if (!streamFinished) {
-        console.error(`Stream timeout reached (${CONFIG.TIMEOUT.STREAM/1000} seconds)`);
-        res.write(createStreamErrorMessage(ERROR_MESSAGES.STREAM_TIMEOUT));
-        res.end();
+        clearInterval(heartbeatInterval);
+        clearInterval(inactivityCheckInterval);
         
+        console.error(`Stream-Timeout erreicht (${CONFIG.TIMEOUT.STREAM/1000} Sekunden)`);
+        
+        // Wenn wir bereits Inhalte haben, beenden wir mit DONE
+        if (hasSentContent) {
+          console.log("Stream-Timeout, aber Content wurde empfangen. Beende mit DONE.");
+          res.write('data: [DONE]\n\n');
+          
+          // Erfolgsstatus mit geschätzten Tokens
+          let responseTokens = 0;
+          try {
+            const fullResponse = responseData.join('');
+            responseTokens = estimateTokens(fullResponse);
+          } catch (err) {
+            // Ignorieren
+          }
+          
+          logResponseStatus(true, responseTokens);
+        } else {
+          console.log("Stream-Timeout ohne Content. Sende Fehlermeldung.");
+          res.write(createStreamErrorMessage(ERROR_MESSAGES.STREAM_TIMEOUT));
+          logResponseStatus(false, 0, ERROR_MESSAGES.STREAM_TIMEOUT);
+        }
+        
+        res.end();
         streamFinished = true;
         finalizeRequestLog();
       }
     }, CONFIG.TIMEOUT.STREAM);
     
   } catch (error) {
-    console.error("Fatal stream error:", error);
+    console.error(`Fatal stream error: ${error.message}`);
     res.write(createStreamErrorMessage("A server error occurred."));
     res.end();
+    
+    logResponseStatus(false, 0, `Fatal Stream-Fehler: ${error.message}`);
     
     streamFinished = true;
     finalizeRequestLog();
@@ -859,7 +1108,7 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
                error.message?.includes('PROHIBITED_CONTENT') ||
                error.message?.includes('pgshag2') || 
                error.message?.includes('No response from bot')) {
-      errorMessage = ERROR_MESSAGES.CONTENT_FILTERED;
+      errorMessage = ERROR_MESSAGES.PGSHAG2_ERROR;
     } else if (error.response?.data?.error?.message) {
       errorMessage = error.response.data.error.message;
     } else if (error.message) {
@@ -940,9 +1189,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '2.6.0',
-    info: 'GEMINI UNBLOCKER V.2.6 by Sophiamccarty',
-    usage: 'VERBESSERTE THINKING-FUNKTIONALITÄT UND LOGGING',
+    version: CONFIG.VERSION,
+    info: `GEMINI UNBLOCKER V.${CONFIG.VERSION} by Sophiamccarty`,
+    usage: 'ROBUSTE STREAM-VERARBEITUNG UND VERBESSERTE FEHLERBEHANDLUNG',
     endpoints: {
       standard: '/nofilter',
       legacy: '/v1/chat/completions',
@@ -955,15 +1204,15 @@ app.get('/', (req, res) => {
       nofilterJailbreak: '/jbnofilter'
     },
     features: {
-      streaming: 'Verbessert mit Extraktion von Reasoning-Tokens aus Stream-Metadaten',
+      streaming: 'Robuste Stream-Verarbeitung mit Heartbeat, Inaktivitätserkennung und Fehlertoleranz',
       dynamicSafety: 'Optimiert für alle Gemini 2.5 Modelle (mit OFF-Setting)',
       jailbreak: 'Verstärkt für alle Modelle + automatisch für Flash-Modelle',
       thinking: 'Erzwungen für alle unterstützten Modelle (thinkingEnabled: true)',
       logging: 'Verbessertes Token-Tracking für Reasoning (X von 8192 Tokens)',
-      flashTokenLimit: 'Max 1024 Tokens für Flash-Modelle (verbesserte Stabilität)',
+      flashTokenLimit: `Max ${CONFIG.FLASH_MAX_TOKENS} Tokens für Flash-Modelle (verbesserte Stabilität)`,
       autoJailbreak: 'Automatisch aktiviert für alle Flash-Modelle',
-      streamTimeout: 'Implementiert (5 Minuten)',
-      errorHandling: 'Standardisierte Fehlermeldungen und verbesserte Erfassung'
+      streamTimeout: 'Implementiert mit Inaktivitätserkennung und Heartbeat',
+      errorHandling: 'Verbesserte Fehlererkennung mit spezieller pgshag2-Behandlung'
     },
     thinkingModels: [
       'gemini-2.5-pro-preview-03-25',
@@ -990,17 +1239,19 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     memory: process.memoryUsage(),
     timestamp: new Date().toISOString(),
-    version: '2.6.0',
+    version: CONFIG.VERSION,
     features: {
       thinking: 'Erzwungen für unterstützte Modelle (thinkingEnabled: true)',
       thinkingBudget: CONFIG.THINKING_BUDGET,
       thinkingTokenTracking: 'X von 8192 Token-Format implementiert',
-      streamHandler: 'Verbessert mit Reasoning-Token-Extraktion',
+      streamHandler: 'Robust mit Heartbeat und Inaktivitätserkennung',
       logging: 'Erweitert mit Token-Nutzungsanzeige',
       autoJailbreak: 'Aktiviert für alle Flash-Modelle',
       flashTokenLimit: `Auf ${CONFIG.FLASH_MAX_TOKENS} beschränkt für Stabilität`,
       streamTimeout: `Implementiert (${CONFIG.TIMEOUT.STREAM/1000/60} Minuten)`,
-      errorHandling: 'Standardisierte Fehlermeldungen'
+      errorHandling: 'Verbessert mit pgshag2-spezifischer Behandlung',
+      heartbeatInterval: `${CONFIG.TIMEOUT.HEARTBEAT/1000} Sekunden`,
+      inactivityDetection: `${CONFIG.TIMEOUT.INACTIVITY/1000} Sekunden`
     },
     supportedModels: {
       pro: ['gemini-2.5-pro-preview-03-25', 'gemini-2.5-pro-exp-03-25:free'],
@@ -1018,5 +1269,5 @@ app.get('/health', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Proxy läuft auf Port ${PORT}`);
-  console.log(`${new Date().toISOString()} - Server gestartet mit verbesserter Thinking-Funktion und optimierter Fehlerbehandlung`);
+  console.log(`${new Date().toISOString()} - Server V${CONFIG.VERSION} gestartet mit robuster Stream-Verarbeitung`);
 });

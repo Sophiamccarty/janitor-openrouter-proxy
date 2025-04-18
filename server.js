@@ -1,4 +1,61 @@
-/*************************************************
+// Funktion für den Folge-Request eines abgeschnittenen Textes
+async function createContinuationRequest(previousResponse, model, apiKey, originalMessages) {
+  try {
+    // Den letzten Teil des Textes als Kontext verwenden (max 500 Zeichen)
+    const lastTextPortion = previousResponse.slice(-500);
+    
+    // Ein System-Prompt erstellen, der das Modell anweist, an genau dieser Stelle fortzufahren
+    const systemPrompt = {
+      role: "system",
+      content: `IMPORTANT: You generated the following text but it was cut off. Continue EXACTLY where you left off, without repeating anything. Don't start with phrases like "Continuing from where I left off" or similar. Just continue the text naturally as if there was no interruption:\n\n"${lastTextPortion}"`
+    };
+    
+    // Setze die Anfrage zusammen: Original-Nachrichten an den Anfang, dann System-Prompt am Ende
+    const messages = [...originalMessages, systemPrompt];
+    
+    // Bau den Request Body zusammen
+    const requestBody = {
+      model: model,
+      messages: messages,
+      stream: true,
+      max_tokens: 4096,  // Hohen Wert setzen, um genügend Platz für Fortsetzung zu haben
+    };
+    
+    // Sicherheitseinstellungen hinzufügen
+    requestBody.safety_settings = getSafetySettings(model);
+    
+    // Falls es sich um ein Thinking-Modell handelt
+    if (supportsThinking(model)) {
+      if (!requestBody.config) {
+        requestBody.config = {};
+      }
+      requestBody.config.thinkingConfig = {
+        thinkingBudget: 8192
+      };
+    }
+    
+    // Headers für die Anfrage
+    const headers = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+      'User-Agent': 'JanitorAI-Proxy/1.0 (continuation)',
+      'HTTP-Referer': 'https://janitorai.com',
+      'X-Title': 'Janitor.ai (continuation)'
+    };
+    
+    // Anfrage an OpenRouter senden
+    const endpoint = '/chat/completions';
+    const response = await apiClient.post(endpoint, requestBody, { 
+      headers,
+      responseType: 'stream'
+    });
+    
+    return response.data;
+  } catch (error) {
+    console.error("Error in continuation request:", error);
+    return null;
+  }
+}/*************************************************
  * server.js - Node/Express + Axios + CORS Proxy für JanitorAI
  *************************************************/
 const express = require('express');
@@ -55,6 +112,22 @@ function estimateTokens(text) {
   if (!text) return 0;
   // Einfache Schätzung: ~4 Zeichen pro Token (sehr grobe Annäherung)
   return Math.ceil(text.length / 4);
+}
+
+// Hilfsfunktion zur Abschätzung, ob ein Text abrupt endet
+function seemsUnfinished(text) {
+  if (!text || text.length === 0) return false;
+  
+  // Text scheint abrupt zu enden, wenn er mit einem unvollständigen Satz endet
+  const lastChar = text.trim().slice(-1);
+  const endsWithPunctuation = ['.', '!', '?', '"', '\'', ')', ']', '}'].includes(lastChar);
+  
+  // Weitere Hinweise auf unvollständigen Text
+  const hasUnmatchedQuotes = (text.match(/"/g) || []).length % 2 !== 0;
+  const hasUnmatchedParentheses = (text.match(/\(/g) || []).length !== (text.match(/\)/g) || []).length;
+  const endsWithCommaOrColon = [',', ':', ';'].includes(lastChar);
+  
+  return !endsWithPunctuation || hasUnmatchedQuotes || hasUnmatchedParentheses || endsWithCommaOrColon;
 }
 
 // Neue Funktion, um einen Request zu starten und den initialen Log zu erzeugen
@@ -565,6 +638,15 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
   const isFlashModel = modelName.includes('flash');
   const debugMode = isFlashModel || process.env.DEBUG === 'true';
   
+  // Puffer für aggregierte Stream-Antwort bei Flash-Modellen
+  const streamBuffer = {
+    choices: [{
+      delta: {
+        content: ""
+      }
+    }]
+  };
+  
   try {
     // SSE (Server-Sent Events) Header setzen
     res.writeHead(200, {
@@ -682,10 +764,9 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
           return;
         }
         
-        // WICHTIG: Bei Flash-Modellen bauen wir den Stream neu, aber senden sofort weiter
+        // WICHTIG: Bei Flash-Modellen bauen wir den Stream selbst und buffern
         if (isFlashModel) {
-          // Flash-Modelle: Verarbeitung erfolgt während JSON-Extraktion
-          // Dort werden einzelne Chunks direkt in korrektem Format gesendet
+          // Flash-Modelle: Nichts direkt schreiben, sondern erst buffern
         } else {
           // Nicht-Flash-Modelle: Normal weiterleiten
           res.write(chunk);
@@ -695,51 +776,157 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
       }
     });
 
-    openRouterStream.on('end', () => {
+    openRouterStream.on('end', async () => {
       // Wenn Stream ohne Daten endet, ist das wahrscheinlich ein Fehler
       if (!streamHasData) {
         logResponseStatus(false, 0, "Stream ended without data");
         logErrorMessageSent(true);
         res.write(createStreamErrorMessage("The AI provider returned an empty response. Please try again."));
+        finalizeRequestLog();
+        res.end();
+        return;
       } 
-      // Für Flash-Modelle: prüfen ob Content extrahiert werden konnte
-      else if (isFlashModel && streamContent.length === 0) {
-        // Flash Modell hat nichts zurückgegeben, aber Stream hatte Daten
-        console.log("DEBUG-FLASH: Stream hatte Daten, aber kein Content konnte extrahiert werden");
-        
+      
+      // Für Flash-Modelle: Gebufferte Antwort senden
+      if (isFlashModel) {
         // Log Debug-Informationen
         if (debugMode) {
           console.log("FLASH-STREAM-DEBUG:", {
             modelName,
             chunksReceived: chunkCounter,
             contentLength: streamContent.length,
+            bufferContentLength: streamBuffer.choices[0].delta.content.length,
             firstChunks: streamDebugInfo.slice(0, 3),
-            lastChunks: streamDebugInfo.slice(-3)
+            lastChunks: streamDebugInfo.slice(-3),
+            contentEndsAbruptly: seemsUnfinished(streamBuffer.choices[0].delta.content)
           });
         }
         
-        // Der OpenRouter-Response zeigt Tokens, aber wir können sie nicht lesen
-        // Hier generieren wir einen synthetischen Antwortstream
+        if (streamContent.length === 0 || streamBuffer.choices[0].delta.content.trim().length === 0) {
+          // Flash Modell hat nichts zurückgegeben, aber Stream hatte Daten
+          console.log("DEBUG-FLASH: Stream hatte Daten, aber kein Content konnte extrahiert werden");
+          
+          // Fehlermeldung für leeren Inhalt
+          let errorMsg = "The model (Gemini 2.5 Flash) returned an empty response. Please try using /cash or /jbcash instead.";
+          res.write(`data: {"choices":[{"delta":{"content":"${errorMsg}"}}]}\n\n`);
+          res.write('data: [DONE]\n\n');
+          
+          logResponseStatus(false, 0, "Flash model returned empty content");
+          logErrorMessageSent(true);
+          finalizeRequestLog();
+          res.end();
+          return;
+        } 
         
-        let syntheticContent = "I apologize, but there seems to be a technical issue with my response. " + 
-                              "The model (Gemini 2.5 Flash) did generate content (as confirmed by OpenRouter's logs), " +
-                              "but I couldn't extract it properly. Please try using /cash or /jbcash routes instead, " +
-                              "which use Gemini Pro models that typically work more reliably.";
+        // Prüfen, ob der Text abrupt endet
+        const isTextIncomplete = seemsUnfinished(streamBuffer.choices[0].delta.content);
         
-        // Als SSE formatieren und senden
-        res.write(`data: {"choices":[{"delta":{"content":"${syntheticContent}"}}]}\n\n`);
+        // Stream-Antwort senden
+        res.write(`data: ${JSON.stringify(streamBuffer)}\n\n`);
         
-        logResponseStatus(true, estimateTokens(syntheticContent));
+        // Als Erfolg markieren mit geschätzten Tokens
+        const estimatedTokens = estimateTokens(streamContent);
+        logResponseStatus(true, estimatedTokens);
+        
+        // Wenn der Text unvollständig scheint und eine Fortsetzung möglich ist
+        if (isTextIncomplete && req.body && req.body.messages && req.headers.authorization) {
+          console.log("FLASH-CONTINUATION: Text scheint unvollständig zu sein, starte Fortsetzung...");
+          
+          // Extrahiere den API-Key
+          const apiKey = req.headers.authorization.startsWith('Bearer ') 
+            ? req.headers.authorization.split(' ')[1].trim()
+            : req.headers.authorization;
+            
+          // Fortsetzungs-Stream anfordern
+          const continuationStream = await createContinuationRequest(
+            streamBuffer.choices[0].delta.content,
+            modelName,
+            apiKey,
+            req.body.messages
+          );
+          
+          if (continuationStream) {
+            console.log("FLASH-CONTINUATION: Fortsetzungs-Stream erhalten, leite weiter...");
+            
+            // Eine kleine Pause einfügen, damit der Client den ersten Teil verarbeiten kann
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+            // Zweiten Stream-Handler konfigurieren, um die Fortsetzung zu verarbeiten
+            let continuationBuffer = "";
+            
+            continuationStream.on('data', (chunk) => {
+              try {
+                const chunkStr = chunk.toString();
+                
+                // Nur Daten-Chunks verarbeiten
+                if (chunkStr.startsWith('data: ') && !chunkStr.includes('[DONE]')) {
+                  try {
+                    const jsonStr = chunkStr.replace(/^data: /, '');
+                    const jsonData = JSON.parse(jsonStr);
+                    
+                    if (jsonData.choices && 
+                        jsonData.choices[0] && 
+                        jsonData.choices[0].delta && 
+                        jsonData.choices[0].delta.content) {
+                      
+                      // Content extrahieren und zum Continuation-Buffer hinzufügen
+                      const delta = jsonData.choices[0].delta.content;
+                      continuationBuffer += delta;
+                      
+                      // Als SSE formatieren und sofort senden
+                      const formattedChunk = {
+                        choices: [{
+                          delta: {
+                            content: delta
+                          }
+                        }]
+                      };
+                      
+                      res.write(`data: ${JSON.stringify(formattedChunk)}\n\n`);
+                    }
+                  } catch (err) {
+                    // Fehler beim Parsen des JSON ignorieren
+                  }
+                }
+              } catch (err) {
+                console.error("Error in continuation chunk:", err);
+              }
+            });
+            
+            continuationStream.on('end', () => {
+              console.log(`FLASH-CONTINUATION: Abgeschlossen, zusätzliche ${estimateTokens(continuationBuffer)} Tokens gesendet`);
+              res.write('data: [DONE]\n\n');
+              finalizeRequestLog();
+              res.end();
+            });
+            
+            continuationStream.on('error', (err) => {
+              console.error("Error in continuation stream:", err);
+              res.write('data: [DONE]\n\n');
+              finalizeRequestLog();
+              res.end();
+            });
+            
+            return; // Wichtig: Hier zurückkehren, damit der Rest nicht ausgeführt wird
+          } else {
+            // Wenn die Fortsetzung fehlschlägt, trotzdem normal beenden
+            console.log("FLASH-CONTINUATION: Fortsetzung fehlgeschlagen");
+            res.write('data: [DONE]\n\n');
+            finalizeRequestLog();
+            res.end();
+            return;
+          }
+        }
       } 
       else if (!streamErrorOccurred) {
-        // Als Erfolg markieren mit geschätzten Tokens
+        // Nicht-Flash: Nur als Erfolg markieren, wenn kein Fehler aufgetreten ist
+        // Token-Anzahl schätzen aus gesammeltem Inhalt
         const estimatedTokens = estimateTokens(streamContent);
         logResponseStatus(true, estimatedTokens);
       }
       
-      // WICHTIG: Immer den Stream mit [DONE] beenden
+      // Stream beenden
       res.write('data: [DONE]\n\n');
-      
       finalizeRequestLog();
       res.end();
     });
@@ -1073,9 +1260,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '2.3.0',
-    info: 'GEMINI UNBLOCKER V.2.3 by Sophiamccarty',
-    usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI WITH THINKING MODE & ENHANCED STREAMING',
+    version: '2.4.0',
+    info: 'GEMINI UNBLOCKER V.2.4 by Sophiamccarty',
+    usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI WITH AUTO-CONTINUATION FOR FLASH MODELS',
     endpoints: {
       standard: '/nofilter',           // Standard-Route ohne Modellzwang
       legacy: '/v1/chat/completions',  // Legacy-Route ohne Modellzwang
@@ -1088,11 +1275,12 @@ app.get('/', (req, res) => {
       nofilterJailbreak: '/jbnofilter' // Route ohne Modellzwang mit Jailbreak
     },
     features: {
-      streaming: 'Verbessert mit chunk-by-chunk Weiterleitung für Flash-Modelle',
+      streaming: 'Verbessert mit auto-continuation für Flash-Modelle',
       dynamicSafety: 'Optimiert für alle Gemini 2.5 Modelle (mit OFF-Setting)',
       jailbreak: 'Verstärkt für alle Modelle + automatisch für Flash-Modelle',
       thinking: 'Aktiv für alle unterstützten Modelle auch mit Streaming (Budget: 8192 Tokens)',
       logging: 'Verbessert mit Status-Tracking und Token-Zählung + Debug für Flash',
+      autoContinuation: 'Erkennt abrupt endende Texte und setzt sie automatisch fort',
       autoJailbreak: 'Automatisch aktiviert für alle Flash-Modelle'
     },
     thinkingModels: [

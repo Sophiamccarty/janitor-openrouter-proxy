@@ -47,6 +47,9 @@ let currentRequestState = {
   errorMessageStatus: { needed: false, sent: false }
 };
 
+// Flag um zu verfolgen, ob eine Anfrage bereits abgeschlossen wurde
+let requestFinalized = false;
+
 // Hilfsfunktion zur Abschätzung der Token-Anzahl (sehr einfach, kann bei Bedarf verbessert werden)
 function estimateTokens(text) {
   if (!text) return 0;
@@ -70,6 +73,9 @@ function startRequestLog(route, requestBody) {
     responseStatus: { success: false, tokens: 0, error: '' },
     errorMessageStatus: { needed: false, sent: false }
   };
+  
+  // Reset des Finalisierungs-Flags für jede neue Anfrage
+  requestFinalized = false;
   
   // Initialer Log
   console.log(`\n== Neue Anfrage über ${route} (${timestamp}) ==`);
@@ -134,8 +140,16 @@ function logErrorMessageSent(success) {
   }
 }
 
-// Funktion zum Abschließen des Logs mit einer Zusammenfassung
+// Funktion zum Abschließen des Logs mit einer Zusammenfassung - mit Schutz gegen mehrfachen Aufruf
 function finalizeRequestLog() {
+  // Prüfen, ob diese Anfrage bereits abgeschlossen wurde
+  if (requestFinalized) {
+    return; // Request bereits abgeschlossen, nichts mehr tun
+  }
+  
+  // Als abgeschlossen markieren
+  requestFinalized = true;
+  
   const totalDuration = new Date() - new Date(currentRequestState.timestamp);
   console.log(`== Anfrage abgeschlossen (Dauer: ${totalDuration}ms) ==\n`);
 }
@@ -426,7 +440,7 @@ function addJailbreakToMessages(body) {
   return newBody;
 }
 
-// Hilfsfunktion für Retry-Logik
+// Hilfsfunktion für Retry-Logik mit verbesserter Stream-Erkennung
 async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream = false) {
   let lastError;
   
@@ -440,9 +454,13 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
           })
         : await apiClient.post(url, data, { headers });
       
+      // Für Stream-Antworten gibt es ein spezielles Handling später
+      if (isStream) {
+        return response;
+      }
+      
       // Prüfen auf leere Antwort (typisch für Content-Filter)
-      if (!isStream && 
-          response.data?.choices?.[0]?.message?.content === "" && 
+      if (response.data?.choices?.[0]?.message?.content === "" && 
           response.data.usage?.completion_tokens === 0) {
         
         return {
@@ -454,16 +472,16 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
       }
       
       // Log für erfolgreiche Thinking-Anwendung bei unterstützten Modellen
-      if (!isStream && supportsThinking(data.model) && response.data?.usage?.completion_tokens) {
+      if (supportsThinking(data.model) && response.data?.usage?.completion_tokens) {
         // Aktualisiere den Thinking-Status mit tatsächlichen Token-Anzahl
         logThinkingStatus(true, response.data.usage.completion_tokens);
       }
       
       // Antworttokens berechnen
       let responseTokens = 0;
-      if (!isStream && response.data?.usage?.completion_tokens) {
+      if (response.data?.usage?.completion_tokens) {
         responseTokens = response.data.usage.completion_tokens;
-      } else if (!isStream && response.data?.choices?.[0]?.message?.content) {
+      } else if (response.data?.choices?.[0]?.message?.content) {
         responseTokens = estimateTokens(response.data.choices[0].message.content);
       }
       
@@ -506,6 +524,9 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
 
 // Verbesserte Stream-Handler-Funktion mit besserer Fehlerbehandlung
 async function handleStreamResponse(openRouterStream, res, modelName = "") {
+  let streamHasData = false;
+  let streamErrorOccurred = false;
+  
   try {
     // SSE (Server-Sent Events) Header setzen
     res.writeHead(200, {
@@ -516,17 +537,73 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
 
     // OpenRouter Stream an Client weiterleiten
     openRouterStream.on('data', (chunk) => {
-      res.write(chunk);
+      try {
+        // Prüfen, ob der Chunk einen Fehler enthält
+        const chunkStr = chunk.toString();
+        streamHasData = true;
+        
+        // Debug: Nach Fehlertypen in den Stream-Daten suchen
+        if (chunkStr.includes('"error"') || 
+            chunkStr.includes('error:') || 
+            chunkStr.includes('PROHIBITED_CONTENT') || 
+            chunkStr.includes('rate limit') ||
+            chunkStr.includes('429') ||
+            chunkStr.includes('403')) {
+          
+          streamErrorOccurred = true;
+          let errorMessage = "An error occurred with the AI provider.";
+          
+          // Rate-Limit-Fehler erkennen
+          if (chunkStr.includes('429') || chunkStr.includes('rate limit') || chunkStr.includes('quota')) {
+            errorMessage = "Sorry my love, Gemini is unfortunately a bit stingy and you're either too fast, (Wait a few seconds, because the free version only allows a few requests per minute.) or you've used up your free messages for the day in the free version. In that case, you either need to switch to the paid version or wait until tomorrow. I'm sorry! Sending you a big hug! <3";
+            logResponseStatus(false, 0, "Rate limit exceeded in stream");
+          } 
+          // Content-Filter-Fehler erkennen
+          else if (chunkStr.includes('403') || chunkStr.includes('PROHIBITED_CONTENT') || chunkStr.includes('content policy')) {
+            errorMessage = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use the Jailbreaked Version /jbfree or /jbcash for NSWF/Violence.";
+            logResponseStatus(false, 0, "Content filter triggered in stream");
+          }
+          else {
+            logResponseStatus(false, 0, `Stream error: ${chunkStr.substring(0, 100)}...`);
+          }
+          
+          logErrorMessageSent(true);
+          
+          // Fehler im Stream-Format an den Client senden
+          res.write(createStreamErrorMessage(errorMessage));
+          
+          // Stream beenden und Anfrage abschließen
+          openRouterStream.destroy();
+          res.end();
+          finalizeRequestLog();
+          return;
+        }
+        
+        // Wenn kein Fehler, schreibe den Chunk normal weiter
+        res.write(chunk);
+      } catch (err) {
+        console.error("Error processing stream chunk:", err);
+      }
     });
 
     openRouterStream.on('end', () => {
-      // Erfolg im Streaming-Modus abschließen
-      logResponseStatus(true, 0); // Token-Anzahl ist im Streaming-Modus nicht zuverlässig ermittelbar
+      // Wenn Stream ohne Daten endet, ist das wahrscheinlich ein Fehler
+      if (!streamHasData) {
+        logResponseStatus(false, 0, "Stream ended without data");
+        logErrorMessageSent(true);
+        res.write(createStreamErrorMessage("The AI provider returned an empty response. Please try again."));
+      } else if (!streamErrorOccurred) {
+        // Nur als Erfolg markieren, wenn kein Fehler aufgetreten ist
+        logResponseStatus(true, 0); // Token-Anzahl ist im Streaming-Modus nicht zuverlässig ermittelbar
+      }
+      
       finalizeRequestLog();
       res.end();
     });
 
     openRouterStream.on('error', (error) => {
+      streamErrorOccurred = true;
+      
       // Formatierte Fehlermeldung je nach Fehlertyp
       let errorMessage = "An error occurred with the AI provider.";
       
@@ -542,25 +619,25 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
       // Log Fehler
       logResponseStatus(false, 0, error.message);
       logErrorMessageSent(true);
-      finalizeRequestLog();
       
       // Fehler im Stream-Format an den Client senden
       res.write(createStreamErrorMessage(errorMessage));
       res.end();
+      finalizeRequestLog();
     });
   } catch (error) {
     // Log Fehler
     logResponseStatus(false, 0, error.message);
     logErrorMessageSent(true);
-    finalizeRequestLog();
     
     // Auch bei internen Fehlern eine freundliche Meldung senden
     res.write(createStreamErrorMessage("A server error occurred. Please try again."));
     res.end();
+    finalizeRequestLog();
   }
 }
 
-// Erweiterte Proxy-Logik mit optionalem Model-Override und Streaming-Support
+// Erweiterte Proxy-Logik mit Verbesserter Stream- und Fehlerbehandlung
 async function handleProxyRequestWithModel(req, res, forceModel = null, useJailbreak = false) {
   try {
     // Request-Log starten und initialen Status setzen
@@ -660,10 +737,9 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
       isStreamingRequested
     );
 
-    // Stream-Anfrage behandeln
+    // Stream-Anfrage behandeln - KEINE Finalisierung hier, das übernimmt jetzt der Stream-Handler
     if (isStreamingRequested && response.data) {
       // Mit verbesserter Fehlerbehandlung und Modellnamen
-      finalizeRequestLog();
       return handleStreamResponse(response.data, res, modelName);
     }
 
@@ -672,7 +748,7 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     if (response.data?.content_filtered) {
       const message = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use the Jailbreaked Version /jbfree or /jbcash for NSWF/Violence.";
       logErrorMessageSent(true);
-      finalizeRequestLog();
+      finalizeRequestLog(); // Finalisierung VOR der Antwort
       return res.status(200).json({
         choices: [{
           message: {
@@ -707,7 +783,7 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
       // Log Fehler
       logResponseStatus(false, 0, errorMessage);
       logErrorMessageSent(true);
-      finalizeRequestLog();
+      finalizeRequestLog(); // Finalisierung VOR der Antwort
       
       // Gib eine formatierte Antwort zurück, die Janitor versteht
       return res.status(200).json({
@@ -720,7 +796,7 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     }
     
     // Wenn keine Fehler, normale Antwort zurückgeben
-    finalizeRequestLog();
+    finalizeRequestLog(); // Finalisierung VOR der Antwort
     return res.json(response.data);
 
   } catch (error) {
@@ -752,7 +828,7 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     // Für den Fall, dass die Response-Statusmeldung noch nicht gesetzt wurde
     logResponseStatus(false, 0, errorMessage);
     logErrorMessageSent(true);
-    finalizeRequestLog();
+    finalizeRequestLog(); // Finalisierung VOR der Antwort
     
     // Konsistentes Fehlerformat für Janitor
     return res.status(200).json({
@@ -817,8 +893,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '1.9.0',
-    info: 'GEMINI UNBLOCKER V.1.6 by Sophiamccarty',
+    version: '2.0.0',
+    info: 'GEMINI UNBLOCKER V.2.0 by Sophiamccarty',
     usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI WITH THINKING MODE',
     endpoints: {
       standard: '/nofilter',           // Standard-Route ohne Modellzwang
@@ -876,5 +952,5 @@ app.get('/health', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Proxy läuft auf Port ${PORT}`);
-  console.log(`${new Date().toISOString()} - Server gestartet mit verbessertem Logging`);
+  console.log(`${new Date().toISOString()} - Server gestartet mit verbessertem Logging und Fehlerbehandlung`);
 });

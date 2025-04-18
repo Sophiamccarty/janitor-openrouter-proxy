@@ -285,12 +285,33 @@ function addJailbreakToMessages(body) {
 function addReasoningToModel(body, modelName) {
   const newBody = { ...body };
   
-  if (modelName.includes(':thinking') || 
+  // Flash-Modelle benötigen spezielle Reasoning-Parameter
+  if (modelName.includes('flash-preview:thinking')) {
+    console.log(`Aktiviere speziellen Flash Thinking Reasoning-Modus für: ${modelName}`);
+    
+    // Für Flash-Modelle mit thinking nur simple tools ohne Funktionsparameter  
+    newBody.tools = [{
+      "type": "function",
+      "function": {
+        "name": "thinking",
+        "description": "Think deeply about this query"
+      }
+    }];
+    
+    // Tool Choice anpassen
+    newBody.tool_choice = {
+      "type": "function",
+      "function": {
+        "name": "thinking"
+      }
+    };
+  }
+  else if (modelName.includes(':thinking') || 
       modelName.includes('reasoning') || 
       modelName === "google/gemini-2.5-pro-preview-03-25" || 
       modelName === "google/gemini-2.5-pro-exp-03-25:free") {
     
-    console.log(`Aktiviere Reasoning-Modus für Modell: ${modelName}`);
+    console.log(`Aktiviere Standard-Reasoning-Modus für Modell: ${modelName}`);
     
     newBody.tools = [{
       "type": "function",
@@ -328,6 +349,19 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
     try {
       console.log(`API-Anfrage an OpenRouter (Versuch ${attempt + 1}/${maxRetries + 1})`);
       
+      // Debug-Ausgabe der Anfrage
+      console.log(`Anfrage-URL: ${url}`);
+      console.log(`Anfrage-Header: ${JSON.stringify(headers)}`);
+      console.log(`Anfrage-Modell: ${data.model}`);
+      
+      // Prüfen auf tools/tool_choice für besseres Debugging
+      if (data.tools) {
+        console.log(`Tools konfiguriert: ${JSON.stringify(data.tools)}`);
+      }
+      if (data.tool_choice) {
+        console.log(`Tool Choice konfiguriert: ${JSON.stringify(data.tool_choice)}`);
+      }
+      
       const response = isStream
         ? await apiClient.post(url, data, { 
             headers,
@@ -335,22 +369,37 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
           })
         : await apiClient.post(url, data, { headers });
       
-      if (!isStream && 
-          response.data?.choices?.[0]?.message?.content === "" && 
-          response.data.usage?.completion_tokens === 0) {
-        console.log("Gemini Content-Filter erkannt (leere Antwort)");
-        return {
-          status: 200,
-          data: {
-            content_filtered: true
-          }
-        };
+      // Erfolgslog mit mehr Details
+      console.log(`OpenRouter-Antwort Status: ${response.status}`);
+      
+      if (!isStream) {
+        if (response.data?.error) {
+          console.log(`OpenRouter-Fehler: ${JSON.stringify(response.data.error)}`);
+        } else if (response.data?.choices?.[0]?.message?.content === "" && 
+            response.data.usage?.completion_tokens === 0) {
+          console.log("Gemini Content-Filter erkannt (leere Antwort)");
+          return {
+            status: 200,
+            data: {
+              content_filtered: true
+            }
+          };
+        }
       }
       
       return response;
       
     } catch (error) {
       lastError = error;
+      
+      // Erweiterte Fehlerdiagnose
+      console.error(`Fehler bei OpenRouter Anfrage: ${error.message}`);
+      if (error.response) {
+        console.error(`Status: ${error.response.status}`);
+        console.error(`Fehler-Details: ${JSON.stringify(error.response.data)}`);
+      } else if (error.request) {
+        console.error('Keine Antwort erhalten');
+      }
       
       const status = error.response?.status;
       
@@ -447,6 +496,23 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
       newBody.model = forceModel;
     }
     
+    // Prüfe, ob wir mit dem Flash thinking Modell arbeiten
+    const isFlashThinking = modelName.includes('flash-preview:thinking');
+    
+    // Bei Flash Thinking einige Parameter entfernen, die Probleme verursachen könnten
+    if (isFlashThinking) {
+      console.log('Flash Thinking Modell erkannt: Passe Anfrage-Parameter an');
+      
+      // Temperature und max_tokens für Flash Thinking optimieren
+      newBody.temperature = 0.7; // Moderate Temperatur
+      
+      // Bei Flash Thinking ist die Streaming-Option manchmal problematisch
+      if (isStreamingRequested) {
+        console.log('Deaktiviere Streaming für Flash Thinking');
+        newBody.stream = false;
+      }
+    }
+    
     if (forceReasoning || modelName.includes(':thinking')) {
       newBody = addReasoningToModel(newBody, modelName);
     }
@@ -519,6 +585,17 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
         });
       }
       
+      // Spezifische Fehlermeldung für Flash Thinking
+      if (isFlashThinking && response.data.error.message?.includes('unk')) {
+        return res.status(200).json({
+          choices: [{
+            message: {
+              content: "Das Flash Thinking Modell ist derzeit nicht verfügbar oder hat einen Fehler. Bitte versuche es mit einem anderen Modell wie /flash25 (ohne thinking) oder /jbcash."
+            }
+          }]
+        });
+      }
+      
       return res.status(200).json({
         choices: [{
           message: {
@@ -567,7 +644,20 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
           }
         ]
       });
-    } else if (error.response?.data?.error?.message) {
+    } 
+    // Spezifische Behandlung für "Provider returned error (unk)"
+    else if (error.message.includes('unk')) {
+      return res.status(200).json({
+        choices: [
+          {
+            message: {
+              content: "Das angeforderte Modell ist derzeit nicht verfügbar ('Provider returned error (unk)'). Bitte versuche es mit einem anderen Modell wie /flash25 (ohne thinking) oder /jbcash."
+            }
+          }
+        ]
+      });
+    }
+    else if (error.response?.data?.error?.message) {
       errorMessage = error.response.data.error.message;
     } else if (error.message) {
       errorMessage = error.message;

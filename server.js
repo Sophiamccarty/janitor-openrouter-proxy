@@ -276,13 +276,21 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
     try {
       console.log(`API-Anfrage an OpenRouter (Versuch ${attempt + 1}/${maxRetries + 1})`);
       
+      // Bei Thinking-Modellen im Stream-Modus speziellen Timeout verwenden
+      const isThinkingStreamRequest = isStream && (data.model && data.model.includes(':thinking'));
+      const timeout = isThinkingStreamRequest ? 60000 : 45000; // 60 Sekunden für Thinking im Stream
+      
       // Stream-Modus oder regulärer Modus
       const response = isStream
         ? await apiClient.post(url, data, { 
             headers,
-            responseType: 'stream'
+            responseType: 'stream',
+            timeout: timeout
           })
-        : await apiClient.post(url, data, { headers });
+        : await apiClient.post(url, data, { 
+            headers,
+            timeout: timeout
+          });
       
       // Prüfen auf leere Antwort (typisch für Content-Filter)
       if (!isStream && 
@@ -334,19 +342,130 @@ async function handleStreamResponse(openRouterStream, res) {
       'Connection': 'keep-alive'
     });
 
+    console.log("Stream-Verarbeitung gestartet");
+    
+    // Lebendes Flag, um zu überprüfen, ob überhaupt Daten empfangen wurden
+    let dataReceived = false;
+    let timeout = null;
+
+    // Timeout setzen für den Fall, dass keine Daten kommen
+    timeout = setTimeout(() => {
+      if (!dataReceived) {
+        console.log("Stream-Timeout: Keine Daten erhalten");
+        // Sende eine Fallback-Nachricht im Stream-Format
+        const fallbackMessage = {
+          choices: [{
+            delta: {
+              content: "Es scheint ein Problem mit dem Modell zu geben. Ich kann keine richtige Antwort erhalten. Bitte versuche es mit einem anderen Modell wie /flash25 (ohne thinking) oder /jbfree."
+            }
+          }]
+        };
+        
+        res.write(`data: ${JSON.stringify(fallbackMessage)}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
+    }, 10000); // 10 Sekunden Timeout
+
     // OpenRouter Stream an Client weiterleiten
     openRouterStream.on('data', (chunk) => {
-      res.write(chunk);
+      dataReceived = true;
+      
+      // Versuche, den Chunk zu dekodieren und zu verstehen
+      const chunkStr = chunk.toString();
+      console.log("Stream-Chunk erhalten: " + chunkStr.substring(0, 50) + "...");
+      
+      // Prüfe auf leeren Chunk oder "data: [DONE]"
+      if (chunkStr.trim() === '' || chunkStr.includes('[DONE]')) {
+        res.write(chunkStr);
+        return;
+      }
+      
+      // Wenn der Chunk nicht korrekt formatiert ist oder Fehler enthält,
+      // formatieren wir ihn um in ein gültiges SSE-Format
+      try {
+        // Versuche den Chunk zu parsen
+        const dataLines = chunkStr.split('\n\n');
+        
+        for (const line of dataLines) {
+          if (!line.trim()) continue;
+          
+          // Wenn es bereits ein korrektes "data: {...}" Format hat
+          if (line.startsWith('data: {')) {
+            res.write(line + '\n\n');
+            continue;
+          }
+          
+          // Versuche zu prüfen, ob es JSON ist
+          if (line.trim().startsWith('{')) {
+            try {
+              // Versuche zu parsen und als SSE-Format zu senden
+              const jsonObj = JSON.parse(line.trim());
+              res.write(`data: ${JSON.stringify(jsonObj)}\n\n`);
+            } catch (e) {
+              // Wenn es kein gültiges JSON ist, sende es als Text-Delta
+              const fallbackFormat = {
+                choices: [{
+                  delta: {
+                    content: line.trim()
+                  }
+                }]
+              };
+              res.write(`data: ${JSON.stringify(fallbackFormat)}\n\n`);
+            }
+          } else {
+            // Fallback für nicht-JSON Formate
+            const textContent = line.replace(/^data: /, '').trim();
+            if (textContent) {
+              const fallbackFormat = {
+                choices: [{
+                  delta: {
+                    content: textContent
+                  }
+                }]
+              };
+              res.write(`data: ${JSON.stringify(fallbackFormat)}\n\n`);
+            }
+          }
+        }
+      } catch (err) {
+        // Wenn alles fehlschlägt, sende den Chunk unverändert
+        console.error("Stream-Parsing-Fehler:", err.message);
+        res.write(chunkStr);
+      }
     });
 
     openRouterStream.on('end', () => {
+      console.log("Stream-Ende erreicht");
+      clearTimeout(timeout);
+      
+      // Stelle sicher, dass wir [DONE] senden, falls es noch nicht gesendet wurde
+      if (dataReceived) {
+        res.write('data: [DONE]\n\n');
+      }
       res.end();
     });
 
     openRouterStream.on('error', (error) => {
       console.error('Stream Error:', error);
+      clearTimeout(timeout);
+      
       // Versuche, einen Fehler im Stream-Format zu senden
-      res.write(`data: {"error": {"message": "${error.message}"}}\n\n`);
+      try {
+        const errorMsg = {
+          choices: [{
+            delta: {
+              content: `ERROR: ${error.message || "Unbekannter Stream-Fehler"}`
+            }
+          }]
+        };
+        res.write(`data: ${JSON.stringify(errorMsg)}\n\n`);
+        res.write('data: [DONE]\n\n');
+      } catch (e) {
+        // Fallback, falls JSON-Serialisierung fehlschlägt
+        res.write(`data: {"error": {"message": "Stream-Fehler"}}\n\n`);
+        res.write('data: [DONE]\n\n');
+      }
       res.end();
     });
   } catch (error) {
@@ -681,6 +800,34 @@ async function handleProxyRequest(req, res) {
   return handleProxyRequestWithModel(req, res);
 }
 
+// Route mit Thinking für das kostenlose und bezahlte Modell
+function setupThinkingRoutes() {
+  // Kostenfreies Thinking-Modell
+  app.post('/profreethinking', async (req, res) => {
+    const requestTimestamp = new Date().toISOString();
+    console.log(`== Neue Anfrage über /profreethinking (${requestTimestamp}) ==`);
+    
+    // Streaming erzwingen für bessere Kompatibilität mit Thinking
+    req.body.stream = true;
+    await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-exp-03-25:thinking", true);
+  });
+  
+  // Kostenpflichtiges Thinking-Modell
+  app.post('/procashthinking', async (req, res) => {
+    const requestTimestamp = new Date().toISOString();
+    console.log(`== Neue Anfrage über /procashthinking (${requestTimestamp}) ==`);
+    
+    // Streaming erzwingen für bessere Kompatibilität mit Thinking
+    req.body.stream = true;
+    await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25:thinking", true);
+  });
+  
+  console.log("Thinking-Routen wurden eingerichtet");
+}
+
+// Richte die Thinking-Modell-Routen ein
+setupThinkingRoutes();
+
 // Route "/free" - Erzwingt das kostenlose Gemini-Modell
 app.post('/free', async (req, res) => {
   const requestTimestamp = new Date().toISOString();
@@ -728,6 +875,16 @@ app.post('/flash25thinking', async (req, res) => {
   const requestTimestamp = new Date().toISOString();
   console.log(`== Neue Anfrage über /flash25thinking (${requestTimestamp}) ==`);
   try {
+    // Überprüfe, ob Streaming angefordert wurde
+    const streamRequested = req.body.stream === true;
+    
+    // Wenn kein Streaming angefordert, erzwinge es für Thinking-Modelle
+    // da dies die Erfolgschancen erhöht
+    if (!streamRequested) {
+      console.log("Streaming für Thinking-Modell wird erzwungen (erhöht Kompatibilität)");
+      req.body.stream = true;
+    }
+    
     // Detaillierte Logs für bessere Fehlerdiagnose
     console.log("Flash25thinking Route wird verarbeitet...");
     await handleProxyRequestWithModel(req, res, "google/gemini-2.5-flash-preview:thinking", true); // Mit Jailbreak
@@ -761,8 +918,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '1.6.1',
-    info: 'GEMINI UNBLOCKER V.1.4 by Sophiamccarty',
+    version: '1.7.0',
+    info: 'GEMINI UNBLOCKER V.1.5 by Sophiamccarty',
     usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI',
     endpoints: {
       standard: '/nofilter',          // Standard-Route ohne Modellzwang
@@ -771,19 +928,21 @@ app.get('/', (req, res) => {
       paid: '/cash',                  // Route mit kostenpflichtigem Gemini-Modell
       freeJailbreak: '/jbfree',       // Route mit kostenlosem Modell und Jailbreak
       paidJailbreak: '/jbcash',       // Route mit kostenpflichtigem Modell und Jailbreak
-      jailbreakNoFilter: '/jbnofilter', // NEUE Route ohne Modellzwang mit Jailbreak
-      flash25: '/flash25',            // NEUE Route für Gemini 2.5 Flash mit Jailbreak
-      flash25Thinking: '/flash25thinking' // NEUE Route für Gemini 2.5 Flash mit Thinking und Jailbreak
+      jailbreakNoFilter: '/jbnofilter', // Route ohne Modellzwang mit Jailbreak
+      flash25: '/flash25',            // Route für Gemini 2.5 Flash mit Jailbreak
+      flash25Thinking: '/flash25thinking', // Route für Gemini 2.5 Flash mit Thinking und Jailbreak
+      proFreeThinking: '/profreethinking', // NEUE Route für Pro Free mit Thinking
+      proCashThinking: '/procashthinking'  // NEUE Route für Pro Cash mit Thinking
     },
     features: {
-      streaming: 'Aktiviert',
+      streaming: 'Verbessert mit automatischem Fallback für Thinking-Modelle',
       dynamicSafety: 'Optimiert für Gemini 2.5 Pro und Flash Modelle (mit OFF-Setting)',
-      jailbreak: 'Verfügbar über /jbfree, /jbcash, /jbnofilter, /flash25 und /flash25thinking',
-      reasoning: 'Verfügbar über /flash25thinking und bei allen :thinking Modellen (experimentell)'
+      jailbreak: 'Verfügbar über /jbfree, /jbcash, /jbnofilter, /flash25, /flash25thinking und alle Thinking-Routen',
+      reasoning: 'Verbesserte Unterstützung für alle :thinking Modelle (experimentell)'
     },
     tips: {
-      thinkingModels: "Flash25Thinking ist experimentell und funktioniert möglicherweise nicht mit allen OpenRouter API-Keys. Bei Problemen bitte /flash25 (ohne Thinking) verwenden.",
-      flashModels: "Die Flash-Modelle sind sehr schnell, aber möglicherweise nicht so kreativ wie die Pro-Modelle. Für Rollenspiele empfehlen wir /jbfree oder /jbcash."
+      thinkingModels: "Thinking-Modelle nutzen jetzt immer Streaming für bessere Zuverlässigkeit. Wenn keine Antwort kommt, versuche die Version ohne Thinking oder warte bis zu 60 Sekunden.",
+      bestPractice: "Für kreative Inhalte empfehlen wir /jbcash oder /procashthinking. Für schnelle Antworten versuche /flash25."
     }
   });
 });

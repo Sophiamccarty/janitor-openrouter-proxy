@@ -194,7 +194,9 @@ function getSafetySettings(modelName) {
     'gemini-2.0-flash', 'gemini-2.0-flash-001',
     'gemini-2.0-flash-exp', 'gemini-2.0-flash-exp-image-generation',
     'gemini-2.5-pro-preview-03-25',
-    'gemini-2.5-pro-exp-03-25:free'  // Füge die Free-Version auch für OFF-Versuch hinzu
+    'gemini-2.5-pro-exp-03-25:free',  // Füge die Free-Version auch für OFF-Versuch hinzu
+    'gemini-2.5-flash-preview',       // Neue Modelle hinzugefügt
+    'gemini-2.5-flash-preview:thinking'
   ];
 
   // Exakte Modellprüfung für unsere speziellen Modelle
@@ -212,6 +214,20 @@ function getSafetySettings(modelName) {
     });
     console.log('Gemini 2.5 Pro Free erkannt: Verwende OFF für alle Safety-Einstellungen (experimentell)');
   }
+  else if (modelName === 'google/gemini-2.5-flash-preview') {
+    // Für die Flash Preview-Version können wir alles auf OFF setzen
+    safetySettings.forEach(setting => {
+      setting.threshold = 'OFF';
+    });
+    console.log('Gemini 2.5 Flash Preview erkannt: Verwende OFF für alle Safety-Einstellungen');
+  }
+  else if (modelName === 'google/gemini-2.5-flash-preview:thinking') {
+    // Für die Flash Preview Thinking-Version können wir alles auf OFF setzen
+    safetySettings.forEach(setting => {
+      setting.threshold = 'OFF';
+    });
+    console.log('Gemini 2.5 Flash Preview Thinking erkannt: Verwende OFF für alle Safety-Einstellungen');
+  }
   // Fallback auf Modell-Listen-Prüfung für andere Modelle
   else if (modelBlockNoneList.some(model => modelName.includes(model))) {
     // Ändere alle Thresholds auf BLOCK_NONE
@@ -227,6 +243,58 @@ function getSafetySettings(modelName) {
   }
 
   return safetySettings;
+}
+
+// Funktion zum Überprüfen, ob ein Modell das "Thinking"-Feature unterstützt
+function supportsThinking(modelName) {
+  // Liste der Modelle, die Thinking unterstützen
+  const thinkingModels = [
+    'gemini-2.5-pro-preview',
+    'gemini-2.5-pro-exp',
+    'gemini-2.0-flash-thinking',
+    'gemini-2.5-flash-preview:thinking',
+    'gemini-2.5-flash-preview'
+  ];
+
+  // Prüfen, ob der Modellname einen der unterstützten Strings enthält
+  return thinkingModels.some(model => modelName.includes(model));
+}
+
+// Funktion zum Hinzufügen der Thinking-Konfiguration, wenn unterstützt
+function addThinkingConfig(body) {
+  // Kopie des Body erstellen
+  const newBody = { ...body };
+  
+  // Prüfen, ob das Modell Thinking unterstützt
+  if (newBody.model && supportsThinking(newBody.model)) {
+    console.log(`=== THINKING-MODUS: Aktiviert für Modell ${newBody.model} ===`);
+    
+    // Standard-Thinking-Budget verwenden (8192 ist ein ausgewogener Wert)
+    const thinkingBudget = 8192;
+    
+    // Wenn keine Konfiguration vorhanden, erstelle sie
+    if (!newBody.config) {
+      newBody.config = {};
+    }
+    
+    // Thinking-Konfiguration hinzufügen
+    newBody.config.thinkingConfig = {
+      thinkingBudget: thinkingBudget
+    };
+    
+    console.log(`✓ THINKING-STATUS: Erfolgreich konfiguriert (Budget: ${thinkingBudget} Tokens)`);
+    
+    // Bei Stream-Anfragen könnte das Thinking nicht richtig funktionieren
+    if (newBody.stream === true) {
+      console.log(`⚠ THINKING-HINWEIS: Stream-Modus aktiviert, Thinking könnte eingeschränkt sein`);
+    }
+  } else {
+    if (newBody.model) {
+      console.log(`ⓘ THINKING-STATUS: Nicht verfügbar für Modell ${newBody.model}`);
+    }
+  }
+  
+  return newBody;
 }
 
 // Hilfsfunktion für Retry-Logik
@@ -258,6 +326,11 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
         };
       }
       
+      // Log für erfolgreiche Thinking-Anwendung bei unterstützten Modellen
+      if (!isStream && supportsThinking(data.model)) {
+        console.log(`✓ THINKING-ERGEBNIS: Antwort erhalten (${response.data?.usage?.completion_tokens || 'unbekannte'} Tokens)`);
+      }
+      
       return response; // Erfolg! Beende Schleife und gib Response zurück
       
     } catch (error) {
@@ -265,6 +338,11 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
       
       // Prüfe, ob es ein Fehler ist, der ein Retry rechtfertigt
       const status = error.response?.status;
+      
+      // Log für fehlgeschlagenes Thinking bei unterstützten Modellen
+      if (supportsThinking(data.model)) {
+        console.log(`✗ THINKING-FEHLER: ${error.message}`);
+      }
       
       // 429 (Rate Limit) oder 5xx (Server-Fehler) rechtfertigen Retry
       const shouldRetry = (status === 429 || (status >= 500 && status < 600));
@@ -390,7 +468,7 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     const dynamicSafetySettings = getSafetySettings(modelName);
 
     // Safety settings hinzufügen und ggf. das vorgegebene Modell
-    const newBody = {
+    let newBody = {
       ...clientBody,
       safety_settings: dynamicSafetySettings,
     };
@@ -400,6 +478,9 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
       console.log(`Überschreibe Modell mit: ${forceModel}`);
       newBody.model = forceModel;
     }
+    
+    // Füge Thinking-Konfiguration hinzu, wenn das Modell es unterstützt
+    newBody = addThinkingConfig(newBody);
 
     // Leite es an Openrouter weiter (mit Retry-Logik)
     const headers = {
@@ -442,7 +523,7 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
       return res.status(200).json({
         choices: [{
           message: {
-            content: "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. The paid version 'Gemini 2.5 Pro Preview' works without problems for NSFW/Violence content."
+            content: "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use the Jailbreaked Version /jbfree or /jbcash for NSWF/Violence."
           }
         }]
       });
@@ -530,7 +611,7 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
         choices: [
           {
             message: {
-              content: "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. The paid version 'Gemini 2.5 Pro Preview' works without problems for NSFW/Violence content."
+              content: "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use the Jailbreaked Version /jbfree or /jbcash for NSWF/Violence."
             }
           }
         ]
@@ -574,6 +655,13 @@ app.post('/cash', async (req, res) => {
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25");
 });
 
+// NEUE ROUTE: "/2.5flashthinking" - Gemini 2.5 Flash Thinking Modell
+app.post('/2.5flashthinking', async (req, res) => {
+  const requestTimestamp = new Date().toISOString();
+  console.log(`== Neue Anfrage über /2.5flashthinking (${requestTimestamp}) ==`);
+  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-flash-preview:thinking");
+});
+
 // NEUE ROUTE: "/jbfree" - Freies Modell mit Jailbreak
 app.post('/jbfree', async (req, res) => {
   const requestTimestamp = new Date().toISOString();
@@ -586,6 +674,13 @@ app.post('/jbcash', async (req, res) => {
   const requestTimestamp = new Date().toISOString();
   console.log(`== Neue Anfrage über /jbcash mit Jailbreak (${requestTimestamp}) ==`);
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25", true);
+});
+
+// NEUE ROUTE: "/jbnotfilter" - Jailbreak ohne Modellzwang
+app.post('/jbnotfilter', async (req, res) => {
+  const requestTimestamp = new Date().toISOString();
+  console.log(`== Neue Anfrage über /jbnotfilter mit Jailbreak (${requestTimestamp}) ==`);
+  await handleProxyRequestWithModel(req, res, null, true);
 });
 
 // Bestehende Proxy-Route "/nofilter" - Modell frei wählbar
@@ -606,22 +701,32 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '1.5.0',
-    info: 'GEMINI UNBLOCKER V.1.2 by Sophiamccarty',
-    usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI',
+    version: '1.7.0',
+    info: 'GEMINI UNBLOCKER V.1.4 by Sophiamccarty',
+    usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI WITH THINKING MODE',
     endpoints: {
-      standard: '/nofilter',          // Standard-Route ohne Modellzwang
-      legacy: '/v1/chat/completions', // Legacy-Route ohne Modellzwang
-      free: '/free',                  // Route mit kostenlosem Gemini-Modell
-      paid: '/cash',                  // Route mit kostenpflichtigem Gemini-Modell
-      freeJailbreak: '/jbfree',       // NEUE Route mit kostenlosem Modell und Jailbreak
-      paidJailbreak: '/jbcash'        // NEUE Route mit kostenpflichtigem Modell und Jailbreak
+      standard: '/nofilter',           // Standard-Route ohne Modellzwang
+      legacy: '/v1/chat/completions',  // Legacy-Route ohne Modellzwang
+      free: '/free',                   // Route mit kostenlosem Gemini-Modell
+      paid: '/cash',                   // Route mit kostenpflichtigem Gemini-Modell
+      flash: '/2.5flashthinking',      // Route mit Gemini 2.5 Flash Preview Thinking
+      freeJailbreak: '/jbfree',        // Route mit kostenlosem Modell und Jailbreak
+      paidJailbreak: '/jbcash',        // Route mit kostenpflichtigem Modell und Jailbreak
+      nofilterJailbreak: '/jbnotfilter' // Route ohne Modellzwang mit Jailbreak
     },
     features: {
       streaming: 'Aktiviert',
-      dynamicSafety: 'Optimiert für google/gemini-2.5-pro-preview-03-25 und google/gemini-2.5-pro-exp-03-25:free (beide mit OFF-Setting)',
-      jailbreak: 'Verfügbar über /freejb und /cashjb'
-    }
+      dynamicSafety: 'Optimiert für alle Gemini 2.5 Modelle (mit OFF-Setting)',
+      jailbreak: 'Verfügbar über /jbfree, /jbcash und /jbnotfilter',
+      thinking: 'Automatisch aktiviert für unterstützte Modelle (Budget: 8192 Tokens)'
+    },
+    thinkingModels: [
+      'gemini-2.5-pro-preview-03-25',
+      'gemini-2.5-pro-exp-03-25:free',
+      'gemini-2.0-flash-thinking',
+      'gemini-2.5-flash-preview:thinking',
+      'gemini-2.5-flash-preview'
+    ]
   });
 });
 
@@ -631,7 +736,20 @@ app.get('/health', (req, res) => {
     status: 'healthy',
     uptime: process.uptime(),
     memory: process.memoryUsage(),
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    features: {
+      thinking: 'Aktiviert für unterstützte Modelle',
+      thinkingBudget: 8192,
+      endpoints: {
+        total: 8,
+        withThinking: 8,
+        withJailbreak: 3
+      }
+    },
+    supportedModels: {
+      pro: ['gemini-2.5-pro-preview-03-25', 'gemini-2.5-pro-exp-03-25:free'],
+      flash: ['gemini-2.5-flash-preview', 'gemini-2.5-flash-preview:thinking']
+    }
   });
 });
 

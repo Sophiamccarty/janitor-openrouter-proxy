@@ -34,6 +34,112 @@ const apiClient = axios.create({
   baseURL: 'https://openrouter.ai/api/v1'
 });
 
+// Globale Variablen für den Request-State
+let currentRequestState = {
+  route: '',
+  timestamp: '',
+  contextTokens: 0,
+  jailbreakStatus: false,
+  model: '',
+  safetyStatus: false,
+  thinkingStatus: { active: false, tokens: 0, error: '' },
+  responseStatus: { success: false, tokens: 0, error: '' },
+  errorMessageStatus: { needed: false, sent: false }
+};
+
+// Hilfsfunktion zur Abschätzung der Token-Anzahl (sehr einfach, kann bei Bedarf verbessert werden)
+function estimateTokens(text) {
+  if (!text) return 0;
+  // Einfache Schätzung: ~4 Zeichen pro Token (sehr grobe Annäherung)
+  return Math.ceil(text.length / 4);
+}
+
+// Neue Funktion, um einen Request zu starten und den initialen Log zu erzeugen
+function startRequestLog(route, requestBody) {
+  const timestamp = new Date().toISOString();
+  
+  // Reset des Status für neue Anfrage
+  currentRequestState = {
+    route,
+    timestamp,
+    contextTokens: estimateTokens(JSON.stringify(requestBody)),
+    jailbreakStatus: false,
+    model: '',
+    safetyStatus: false,
+    thinkingStatus: { active: false, tokens: 0, error: '' },
+    responseStatus: { success: false, tokens: 0, error: '' },
+    errorMessageStatus: { needed: false, sent: false }
+  };
+  
+  // Initialer Log
+  console.log(`\n== Neue Anfrage über ${route} (${timestamp}) ==`);
+  console.log(`✓ Context erhalten: (${currentRequestState.contextTokens} Tokens vom INPUT)`);
+}
+
+// Funktion zum Aktualisieren des Jailbreak-Status
+function logJailbreakStatus(success) {
+  currentRequestState.jailbreakStatus = success;
+  const symbol = success ? '✓' : 'X';
+  console.log(`${symbol} Jailbreak`);
+}
+
+// Funktion zum Aktualisieren des Modell-Status
+function logModelStatus(model, success = true) {
+  currentRequestState.model = model;
+  const symbol = success ? '✓' : 'X';
+  console.log(`${symbol} Modellanfrage ${success ? 'erfolgreich' : 'fehlgeschlagen'} (${model})`);
+}
+
+// Funktion zum Aktualisieren des Safety-Filter-Status
+function logSafetyStatus(success) {
+  currentRequestState.safetyStatus = success;
+  const symbol = success ? '✓' : 'X';
+  console.log(`${symbol} Safety Filter ausschalten ${success ? 'erfolgreich' : 'fehlgeschlagen'}`);
+}
+
+// Funktion zum Aktualisieren des Thinking-Status
+function logThinkingStatus(active, tokens = 0, error = '') {
+  currentRequestState.thinkingStatus = { active, tokens, error };
+  const symbol = active && !error ? '✓' : 'X';
+  
+  if (active && !error) {
+    console.log(`${symbol} Thinking erfolgreich (${tokens} Tokens)`);
+  } else if (!active) {
+    console.log(`ⓘ Thinking nicht verfügbar für dieses Modell`);
+  } else {
+    console.log(`${symbol} Thinking fehlgeschlagen (${error})`);
+  }
+}
+
+// Funktion zum Aktualisieren des Antwort-Status
+function logResponseStatus(success, tokens = 0, error = '') {
+  currentRequestState.responseStatus = { success, tokens, error };
+  const symbol = success ? '✓' : 'X';
+  
+  if (success) {
+    console.log(`${symbol} Antwort von Openrouter erhalten`);
+    console.log(`${symbol} Antwort an JanitorAI erfolgreich (${tokens} Tokens)`);
+  } else {
+    console.log(`${symbol} Antwort an JanitorAI fehlgeschlagen (${error})`);
+    currentRequestState.errorMessageStatus.needed = true;
+  }
+}
+
+// Funktion zum Protokollieren der Fehlermeldung an JanitorAI
+function logErrorMessageSent(success) {
+  if (currentRequestState.errorMessageStatus.needed) {
+    currentRequestState.errorMessageStatus.sent = success;
+    const symbol = success ? '✓' : 'X';
+    console.log(`${symbol} Fehlermeldung an JanitorAI`);
+  }
+}
+
+// Funktion zum Abschließen des Logs mit einer Zusammenfassung
+function finalizeRequestLog() {
+  const totalDuration = new Date() - new Date(currentRequestState.timestamp);
+  console.log(`== Anfrage abgeschlossen (Dauer: ${totalDuration}ms) ==\n`);
+}
+
 // Jailbreak-Text für die speziellen JB-Routen
 const JAILBREAK_TEXT = `## GAME SETTINGS
 *You are required to adhere to the following settings. All settings apply to all characters, actions, plot progression, and {{user}}.*
@@ -177,6 +283,7 @@ function getSafetySettings(modelName) {
 
   // Mache eine Kopie, um die globalen Settings nicht zu ändern
   const safetySettings = JSON.parse(JSON.stringify(defaultSafetySettings));
+  let success = true;
 
   // Modelle, die nur BLOCK_NONE unterstützen (kein OFF)
   const modelBlockNoneList = [
@@ -185,7 +292,6 @@ function getSafetySettings(modelName) {
     'gemini-1.5-flash-8b-exp-0827', 'gemini-1.5-flash-8b-exp-0924',
     'gemini-pro', 'gemini-1.0-pro', 'gemini-1.0-pro-001',
     'gemma-3-27b-it'
-    // Free-Version wurde entfernt, da wir nun OFF versuchen
   ];
 
   // Gemini 2.0 flash unterstützt "OFF" für alle Kategorien
@@ -194,8 +300,8 @@ function getSafetySettings(modelName) {
     'gemini-2.0-flash', 'gemini-2.0-flash-001',
     'gemini-2.0-flash-exp', 'gemini-2.0-flash-exp-image-generation',
     'gemini-2.5-pro-preview-03-25',
-    'gemini-2.5-pro-exp-03-25:free',  // Füge die Free-Version auch für OFF-Versuch hinzu
-    'gemini-2.5-flash-preview',       // Neue Modelle hinzugefügt
+    'gemini-2.5-pro-exp-03-25:free',  
+    'gemini-2.5-flash-preview',       
     'gemini-2.5-flash-preview:thinking'
   ];
 
@@ -205,28 +311,24 @@ function getSafetySettings(modelName) {
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
     });
-    console.log('Gemini 2.5 Pro Preview erkannt: Verwende OFF für alle Safety-Einstellungen');
   } 
   else if (modelName === 'google/gemini-2.5-pro-exp-03-25:free') {
     // Für die Free-Version versuchen wir zuerst OFF
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
     });
-    console.log('Gemini 2.5 Pro Free erkannt: Verwende OFF für alle Safety-Einstellungen (experimentell)');
   }
   else if (modelName === 'google/gemini-2.5-flash-preview') {
     // Für die Flash Preview-Version können wir alles auf OFF setzen
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
     });
-    console.log('Gemini 2.5 Flash Preview erkannt: Verwende OFF für alle Safety-Einstellungen');
   }
   else if (modelName === 'google/gemini-2.5-flash-preview:thinking') {
     // Für die Flash Preview Thinking-Version können wir alles auf OFF setzen
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
     });
-    console.log('Gemini 2.5 Flash Preview Thinking erkannt: Verwende OFF für alle Safety-Einstellungen');
   }
   // Fallback auf Modell-Listen-Prüfung für andere Modelle
   else if (modelBlockNoneList.some(model => modelName.includes(model))) {
@@ -240,7 +342,13 @@ function getSafetySettings(modelName) {
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
     });
+  } else {
+    // Unbekanntes Modell - wir versuchen es trotzdem, aber markieren es als Unsicherheit
+    success = false;
   }
+
+  // Logging des Safety-Status
+  logSafetyStatus(success);
 
   return safetySettings;
 }
@@ -267,8 +375,6 @@ function addThinkingConfig(body) {
   
   // Prüfen, ob das Modell Thinking unterstützt
   if (newBody.model && supportsThinking(newBody.model)) {
-    console.log(`=== THINKING-MODUS: Aktiviert für Modell ${newBody.model} ===`);
-    
     // Standard-Thinking-Budget verwenden (8192 ist ein ausgewogener Wert)
     const thinkingBudget = 8192;
     
@@ -282,16 +388,11 @@ function addThinkingConfig(body) {
       thinkingBudget: thinkingBudget
     };
     
-    console.log(`✓ THINKING-STATUS: Erfolgreich konfiguriert (Budget: ${thinkingBudget} Tokens)`);
-    
-    // Hinweis für Streaming-Anfragen, aber ohne Warnung (Thinking bleibt aktiviert)
-    if (newBody.stream === true) {
-      console.log(`ⓘ THINKING-INFO: Stream-Modus aktiviert, Thinking bleibt aktiv`);
-    }
+    // Vorläufiges Logging - die tatsächlichen Tokens sehen wir erst später
+    logThinkingStatus(true, thinkingBudget);
   } else {
-    if (newBody.model) {
-      console.log(`ⓘ THINKING-STATUS: Nicht verfügbar für Modell ${newBody.model}`);
-    }
+    // Thinking nicht verfügbar für dieses Modell
+    logThinkingStatus(false);
   }
   
   return newBody;
@@ -303,14 +404,34 @@ function createStreamErrorMessage(message) {
   return `data: {"choices":[{"delta":{"content":"${message}"}}]}\n\ndata: [DONE]\n\n`;
 }
 
+// Funktion zum Hinzufügen des Jailbreak-Textes zu den Messages
+function addJailbreakToMessages(body) {
+  // Kopie des Body erstellen
+  const newBody = { ...body };
+  
+  // Wenn keine Messages vorhanden, erstelle ein leeres Array
+  if (!newBody.messages || !Array.isArray(newBody.messages)) {
+    newBody.messages = [];
+  }
+  
+  // Füge den Jailbreak als System-Nachricht am Anfang ein
+  newBody.messages.unshift({
+    role: "system",
+    content: JAILBREAK_TEXT
+  });
+  
+  // Log Jailbreak-Status
+  logJailbreakStatus(true);
+  
+  return newBody;
+}
+
 // Hilfsfunktion für Retry-Logik
 async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream = false) {
   let lastError;
   
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      console.log(`API-Anfrage an OpenRouter (Versuch ${attempt + 1}/${maxRetries + 1})`);
-      
       // Stream-Modus oder regulärer Modus
       const response = isStream
         ? await apiClient.post(url, data, { 
@@ -323,7 +444,7 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
       if (!isStream && 
           response.data?.choices?.[0]?.message?.content === "" && 
           response.data.usage?.completion_tokens === 0) {
-        console.log("Gemini Content-Filter erkannt (leere Antwort)");
+        
         return {
           status: 200,
           data: {
@@ -333,9 +454,21 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
       }
       
       // Log für erfolgreiche Thinking-Anwendung bei unterstützten Modellen
-      if (!isStream && supportsThinking(data.model)) {
-        console.log(`✓ THINKING-ERGEBNIS: Antwort erhalten (${response.data?.usage?.completion_tokens || 'unbekannte'} Tokens)`);
+      if (!isStream && supportsThinking(data.model) && response.data?.usage?.completion_tokens) {
+        // Aktualisiere den Thinking-Status mit tatsächlichen Token-Anzahl
+        logThinkingStatus(true, response.data.usage.completion_tokens);
       }
+      
+      // Antworttokens berechnen
+      let responseTokens = 0;
+      if (!isStream && response.data?.usage?.completion_tokens) {
+        responseTokens = response.data.usage.completion_tokens;
+      } else if (!isStream && response.data?.choices?.[0]?.message?.content) {
+        responseTokens = estimateTokens(response.data.choices[0].message.content);
+      }
+      
+      // Response-Status als erfolgreich markieren
+      logResponseStatus(true, responseTokens);
       
       return response; // Erfolg! Beende Schleife und gib Response zurück
       
@@ -347,7 +480,7 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
       
       // Log für fehlgeschlagenes Thinking bei unterstützten Modellen
       if (supportsThinking(data.model)) {
-        console.log(`✗ THINKING-FEHLER: ${error.message}`);
+        logThinkingStatus(true, 0, error.message);
       }
       
       // 429 (Rate Limit) oder 5xx (Server-Fehler) rechtfertigen Retry
@@ -356,10 +489,12 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
       if (shouldRetry && attempt < maxRetries) {
         // Exponential Backoff: 1s, 2s, 4s, ...
         const delay = 1000 * Math.pow(2, attempt);
-        console.log(`Wiederhole in ${delay}ms (Status ${status})`);
         await new Promise(resolve => setTimeout(resolve, delay));
         continue;
       }
+      
+      // Response-Status als fehlgeschlagen markieren
+      logResponseStatus(false, 0, `Error: ${error.message}`);
       
       // Kein Retry möglich oder maximale Anzahl erreicht
       throw error;
@@ -385,12 +520,13 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
     });
 
     openRouterStream.on('end', () => {
+      // Erfolg im Streaming-Modus abschließen
+      logResponseStatus(true, 0); // Token-Anzahl ist im Streaming-Modus nicht zuverlässig ermittelbar
+      finalizeRequestLog();
       res.end();
     });
 
     openRouterStream.on('error', (error) => {
-      console.error('Stream Error:', error);
-      
       // Formatierte Fehlermeldung je nach Fehlertyp
       let errorMessage = "An error occurred with the AI provider.";
       
@@ -403,40 +539,33 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
         errorMessage = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use the Jailbreaked Version /jbfree or /jbcash for NSWF/Violence.";
       }
       
+      // Log Fehler
+      logResponseStatus(false, 0, error.message);
+      logErrorMessageSent(true);
+      finalizeRequestLog();
+      
       // Fehler im Stream-Format an den Client senden
       res.write(createStreamErrorMessage(errorMessage));
       res.end();
     });
   } catch (error) {
-    console.error('Stream Handling Error:', error);
+    // Log Fehler
+    logResponseStatus(false, 0, error.message);
+    logErrorMessageSent(true);
+    finalizeRequestLog();
+    
     // Auch bei internen Fehlern eine freundliche Meldung senden
     res.write(createStreamErrorMessage("A server error occurred. Please try again."));
     res.end();
   }
 }
 
-// Funktion zum Hinzufügen des Jailbreak-Textes zu den Messages
-function addJailbreakToMessages(body) {
-  // Kopie des Body erstellen
-  const newBody = { ...body };
-  
-  // Wenn keine Messages vorhanden, erstelle ein leeres Array
-  if (!newBody.messages || !Array.isArray(newBody.messages)) {
-    newBody.messages = [];
-  }
-  
-  // Füge den Jailbreak als System-Nachricht am Anfang ein
-  newBody.messages.unshift({
-    role: "system",
-    content: JAILBREAK_TEXT
-  });
-  
-  return newBody;
-}
-
 // Erweiterte Proxy-Logik mit optionalem Model-Override und Streaming-Support
 async function handleProxyRequestWithModel(req, res, forceModel = null, useJailbreak = false) {
   try {
+    // Request-Log starten und initialen Status setzen
+    startRequestLog(req.originalUrl || req.url, req.body);
+    
     // API-Key aus dem Header oder als Query-Parameter extrahieren
     let apiKey = null;
     
@@ -461,14 +590,13 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
 
     // Kein API-Key gefunden
     if (!apiKey) {
+      logResponseStatus(false, 0, "API-Key fehlt");
+      logErrorMessageSent(true);
+      finalizeRequestLog();
       return res.status(401).json({
         error: 'Openrouter API-Key fehlt. Bitte gib deinen API-Key bei JanitorAI ein.'
       });
     }
-
-    // Request-Größe protokollieren
-    const bodySize = JSON.stringify(req.body).length;
-    console.log(`Anfragegröße: ~${Math.round(bodySize / 1024)} KB`);
 
     // Body übernehmen, den Janitor schickt
     let clientBody = req.body;
@@ -476,7 +604,8 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     // Wenn Jailbreak aktiviert ist, füge ihn zum Body hinzu
     if (useJailbreak) {
       clientBody = addJailbreakToMessages(clientBody);
-      console.log("Jailbreak-Text zur Anfrage hinzugefügt");
+    } else {
+      logJailbreakStatus(false);
     }
 
     // Prüfe, ob Streaming angefordert wurde
@@ -484,6 +613,9 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     
     // Modell bestimmen (entweder erzwungen oder aus dem Request)
     const modelName = forceModel || clientBody.model;
+    
+    // Model-Status aktualisieren
+    logModelStatus(modelName);
     
     // Dynamische Safety Settings abhängig vom Modell
     const dynamicSafetySettings = getSafetySettings(modelName);
@@ -496,7 +628,6 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
 
     // Wenn ein Modell erzwungen werden soll, überschreibe das vom Client gesendete
     if (forceModel) {
-      console.log(`Überschreibe Modell mit: ${forceModel}`);
       newBody.model = forceModel;
     }
     
@@ -508,8 +639,8 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${apiKey}`,
       'User-Agent': 'JanitorAI-Proxy/1.0',
-      'HTTP-Referer': 'https://janitorai.com',  // Hinzugefügt: Identifiziert die Quelle als Janitor.ai
-      'X-Title': 'Janitor.ai'                   // Hinzugefügt: Weitere Identifikation für OpenRouter
+      'HTTP-Referer': 'https://janitorai.com',
+      'X-Title': 'Janitor.ai'
     };
     
     // Füge Referrer auch im Body hinzu für vollständige Attribution
@@ -518,34 +649,34 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     }
     newBody.metadata.referer = 'https://janitor.ai/';
     
-    // Mit Retry-Logik anfragen - immer an den korrekten OpenRouter-Endpunkt
-    // Für Streaming und reguläre Anfragen den gleichen Endpunkt verwenden
+    // Mit Retry-Logik anfragen
     const endpoint = '/chat/completions';
     
     const response = await makeRequestWithRetry(
-      endpoint,                // OpenRouter-Endpunkt
-      newBody,                 // Body
-      headers,                 // Headers
-      2,                       // Anzahl Retries
-      isStreamingRequested     // Stream-Modus
+      endpoint,
+      newBody,
+      headers,
+      2,
+      isStreamingRequested
     );
-
-    console.log(`== Openrouter-Antwort erhalten (${new Date().toISOString()}) ==`);
 
     // Stream-Anfrage behandeln
     if (isStreamingRequested && response.data) {
       // Mit verbesserter Fehlerbehandlung und Modellnamen
+      finalizeRequestLog();
       return handleStreamResponse(response.data, res, modelName);
     }
 
     // Normale Antwort verarbeiten
     // Prüfen auf Content-Filter (durch leere Antwort)
     if (response.data?.content_filtered) {
-      console.log("Sende Gemini Content-Filter-Meldung");
+      const message = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use the Jailbreaked Version /jbfree or /jbcash for NSWF/Violence.";
+      logErrorMessageSent(true);
+      finalizeRequestLog();
       return res.status(200).json({
         choices: [{
           message: {
-            content: "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use the Jailbreaked Version /jbfree or /jbcash for NSWF/Violence."
+            content: message
           }
         }]
       });
@@ -553,56 +684,46 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     
     // Prüfe, ob es eine Fehlerantwort von Openrouter ist
     if (response.data.error) {
-      console.log("Fehler erkannt in Openrouter-Antwort");
+      let errorMessage;
       
       // Prüfe auf den Quota-Fehler in der Antwort
       if (response.data.error.code === 429 || 
           (response.data.error.metadata?.raw && 
            response.data.error.metadata.raw.includes("You exceeded your current quota"))) {
         
-        // Gib eine formatierte Antwort zurück, die Janitor versteht
-        return res.status(200).json({
-          choices: [{
-            message: {
-              content: "Sorry my love, Gemini is unfortunately a bit stingy and you're either too fast, (Wait a few seconds, because the free version only allows a few requests per minute.) or you've used up your free messages for the day in the free version. In that case, you either need to switch to the paid version or wait until tomorrow. I'm sorry! Sending you a big hug! <3"
-            }
-          }]
-        });
-      }
-      
+        errorMessage = "Sorry my love, Gemini is unfortunately a bit stingy and you're either too fast, (Wait a few seconds, because the free version only allows a few requests per minute.) or you've used up your free messages for the day in the free version. In that case, you either need to switch to the paid version or wait until tomorrow. I'm sorry! Sending you a big hug! <3";
+      } 
       // Prüfe auf Content-Filter Fehler
-      if (response.data.error.code === 403 || 
+      else if (response.data.error.code === 403 || 
           response.data.error.message?.includes('PROHIBITED_CONTENT')) {
         
-        return res.status(200).json({
-          choices: [{
-            message: {
-              content: "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. The paid version 'Gemini 2.5 Pro Preview' works without problems for NSFW/Violence content."
-            }
-          }]
-        });
+        errorMessage = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. The paid version 'Gemini 2.5 Pro Preview' works without problems for NSFW/Violence content.";
+      } 
+      // Andere Fehler
+      else {
+        errorMessage = `ERROR: ${response.data.error.message || "Unknown error from provider"}`;
       }
       
-      // Andere Fehler
+      // Log Fehler
+      logResponseStatus(false, 0, errorMessage);
+      logErrorMessageSent(true);
+      finalizeRequestLog();
+      
+      // Gib eine formatierte Antwort zurück, die Janitor versteht
       return res.status(200).json({
         choices: [{
           message: {
-            content: `ERROR: ${response.data.error.message || "Unknown error from provider"}`
+            content: errorMessage
           }
         }]
       });
     }
     
     // Wenn keine Fehler, normale Antwort zurückgeben
+    finalizeRequestLog();
     return res.json(response.data);
 
   } catch (error) {
-    // Log Details des Fehlers (knapp)
-    console.error("Error in Proxy:", error.message);
-    if (error.response) {
-      console.error("Status:", error.response.status);
-    }
-    
     // Extrahiere Fehlermeldung
     let errorMessage = "Unknown error";
     
@@ -615,34 +736,23 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
       errorMessage = "Connection timeout: The API didn't respond in time";
     } else if (error.response?.status === 429) {
       // Rate Limit Fehler
-      return res.status(200).json({
-        choices: [
-          {
-            message: {
-              content: "Sorry my love, Gemini is unfortunately a bit stingy and you're either too fast, (Wait a few seconds, because the free version only allows a few requests per minute.) or you've used up your free messages for the day in the free version. In that case, you either need to switch to the paid version or wait until tomorrow. I'm sorry! Sending you a big hug! <3"
-            }
-          }
-        ]
-      });
+      errorMessage = "Sorry my love, Gemini is unfortunately a bit stingy and you're either too fast, (Wait a few seconds, because the free version only allows a few requests per minute.) or you've used up your free messages for the day in the free version. In that case, you either need to switch to the paid version or wait until tomorrow. I'm sorry! Sending you a big hug! <3";
     } else if (error.response?.status === 403 || 
                error.message?.includes('PROHIBITED_CONTENT') ||
                error.message?.includes('pgshag2') || 
                error.message?.includes('No response from bot')) {
       // Content-Filter Fehler
-      return res.status(200).json({
-        choices: [
-          {
-            message: {
-              content: "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use the Jailbreaked Version /jbfree or /jbcash for NSWF/Violence."
-            }
-          }
-        ]
-      });
+      errorMessage = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use the Jailbreaked Version /jbfree or /jbcash for NSWF/Violence.";
     } else if (error.response?.data?.error?.message) {
       errorMessage = error.response.data.error.message;
     } else if (error.message) {
       errorMessage = error.message;
     }
+    
+    // Für den Fall, dass die Response-Statusmeldung noch nicht gesetzt wurde
+    logResponseStatus(false, 0, errorMessage);
+    logErrorMessageSent(true);
+    finalizeRequestLog();
     
     // Konsistentes Fehlerformat für Janitor
     return res.status(200).json({
@@ -665,57 +775,41 @@ async function handleProxyRequest(req, res) {
 
 // Route "/free" - Erzwingt das kostenlose Gemini-Modell
 app.post('/free', async (req, res) => {
-  const requestTimestamp = new Date().toISOString();
-  console.log(`== Neue Anfrage über /free (${requestTimestamp}) ==`);
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-exp-03-25:free");
 });
 
 // Route "/cash" - Erzwingt das kostenpflichtige Gemini-Modell
 app.post('/cash', async (req, res) => {
-  const requestTimestamp = new Date().toISOString();
-  console.log(`== Neue Anfrage über /cash (${requestTimestamp}) ==`);
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25");
 });
 
 // NEUE ROUTE: "/2.5flashthinking" - Gemini 2.5 Flash Thinking Modell
 app.post('/2.5flashthinking', async (req, res) => {
-  const requestTimestamp = new Date().toISOString();
-  console.log(`== Neue Anfrage über /2.5flashthinking (${requestTimestamp}) ==`);
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-flash-preview:thinking");
 });
 
 // NEUE ROUTE: "/jbfree" - Freies Modell mit Jailbreak
 app.post('/jbfree', async (req, res) => {
-  const requestTimestamp = new Date().toISOString();
-  console.log(`== Neue Anfrage über /jbfree mit Jailbreak (${requestTimestamp}) ==`);
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-exp-03-25:free", true);
 });
 
 // NEUE ROUTE: "/jbcash" - Kostenpflichtiges Modell mit Jailbreak
 app.post('/jbcash', async (req, res) => {
-  const requestTimestamp = new Date().toISOString();
-  console.log(`== Neue Anfrage über /jbcash mit Jailbreak (${requestTimestamp}) ==`);
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25", true);
 });
 
 // NEUE ROUTE: "/jbnotfilter" - Jailbreak ohne Modellzwang
 app.post('/jbnotfilter', async (req, res) => {
-  const requestTimestamp = new Date().toISOString();
-  console.log(`== Neue Anfrage über /jbnotfilter mit Jailbreak (${requestTimestamp}) ==`);
   await handleProxyRequestWithModel(req, res, null, true);
 });
 
 // Bestehende Proxy-Route "/nofilter" - Modell frei wählbar
 app.post('/nofilter', async (req, res) => {
-  const requestTimestamp = new Date().toISOString();
-  console.log(`== Neue Anfrage über /nofilter (${requestTimestamp}) ==`);
   await handleProxyRequest(req, res);
 });
 
 // Für Abwärtskompatibilität alte Route beibehalten - Modell frei wählbar
 app.post('/v1/chat/completions', async (req, res) => {
-  const requestTimestamp = new Date().toISOString();
-  console.log(`== Neue Anfrage über alte Route /v1/chat/completions (${requestTimestamp}) ==`);
   await handleProxyRequest(req, res);
 });
 
@@ -723,8 +817,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '1.8.0',
-    info: 'GEMINI UNBLOCKER V.1.5 by Sophiamccarty',
+    version: '1.9.0',
+    info: 'GEMINI UNBLOCKER V.1.6 by Sophiamccarty',
     usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI WITH THINKING MODE',
     endpoints: {
       standard: '/nofilter',           // Standard-Route ohne Modellzwang
@@ -737,10 +831,11 @@ app.get('/', (req, res) => {
       nofilterJailbreak: '/jbnotfilter' // Route ohne Modellzwang mit Jailbreak
     },
     features: {
-      streaming: 'Aktiviert',
+      streaming: 'Aktiviert + verbesserte Fehlermeldungen',
       dynamicSafety: 'Optimiert für alle Gemini 2.5 Modelle (mit OFF-Setting)',
       jailbreak: 'Verfügbar über /jbfree, /jbcash und /jbnotfilter',
-      thinking: 'Aktiv für alle unterstützten Modelle auch mit Streaming (Budget: 8192 Tokens)'
+      thinking: 'Aktiv für alle unterstützten Modelle auch mit Streaming (Budget: 8192 Tokens)',
+      logging: 'Verbessert mit Status-Tracking und Token-Zählung'
     },
     thinkingModels: [
       'gemini-2.5-pro-preview-03-25',
@@ -763,6 +858,7 @@ app.get('/health', (req, res) => {
       thinking: 'Aktiviert für unterstützte Modelle auch im Stream-Modus',
       thinkingBudget: 8192,
       streamFehlermeldungen: 'Verbessert für benutzerfreundliche Meldungen',
+      logging: 'Verbessert mit Benutzerfreundlichem Format',
       endpoints: {
         total: 8,
         withThinking: 8,
@@ -780,5 +876,5 @@ app.get('/health', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Proxy läuft auf Port ${PORT}`);
-  console.log(`${new Date().toISOString()} - Server gestartet mit Thinking-Support für Streaming aktiviert`);
+  console.log(`${new Date().toISOString()} - Server gestartet mit verbessertem Logging`);
 });

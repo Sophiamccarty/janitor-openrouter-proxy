@@ -284,9 +284,9 @@ function addThinkingConfig(body) {
     
     console.log(`✓ THINKING-STATUS: Erfolgreich konfiguriert (Budget: ${thinkingBudget} Tokens)`);
     
-    // Bei Stream-Anfragen könnte das Thinking nicht richtig funktionieren
+    // Hinweis für Streaming-Anfragen, aber ohne Warnung (Thinking bleibt aktiviert)
     if (newBody.stream === true) {
-      console.log(`⚠ THINKING-HINWEIS: Stream-Modus aktiviert, Thinking könnte eingeschränkt sein`);
+      console.log(`ⓘ THINKING-INFO: Stream-Modus aktiviert, Thinking bleibt aktiv`);
     }
   } else {
     if (newBody.model) {
@@ -295,6 +295,12 @@ function addThinkingConfig(body) {
   }
   
   return newBody;
+}
+
+// Formatierte Fehlermeldung für Stream-Antworten
+function createStreamErrorMessage(message) {
+  // Format für SSE-Nachrichten mit Fehler im Janitor-kompatiblen Format
+  return `data: {"choices":[{"delta":{"content":"${message}"}}]}\n\ndata: [DONE]\n\n`;
 }
 
 // Hilfsfunktion für Retry-Logik
@@ -363,8 +369,8 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
   throw lastError; // Sollte nie erreicht werden, aber zur Sicherheit
 }
 
-// Stream-Handler-Funktion
-async function handleStreamResponse(openRouterStream, res) {
+// Verbesserte Stream-Handler-Funktion mit besserer Fehlerbehandlung
+async function handleStreamResponse(openRouterStream, res, modelName = "") {
   try {
     // SSE (Server-Sent Events) Header setzen
     res.writeHead(200, {
@@ -384,13 +390,28 @@ async function handleStreamResponse(openRouterStream, res) {
 
     openRouterStream.on('error', (error) => {
       console.error('Stream Error:', error);
-      // Versuche, einen Fehler im Stream-Format zu senden
-      res.write(`data: {"error": {"message": "${error.message}"}}\n\n`);
+      
+      // Formatierte Fehlermeldung je nach Fehlertyp
+      let errorMessage = "An error occurred with the AI provider.";
+      
+      // Rate-Limit-Fehler erkennen und spezifische Meldung senden
+      if (error.message?.includes('429') || error.message?.includes('rate') || error.message?.includes('quota')) {
+        errorMessage = "Sorry my love, Gemini is unfortunately a bit stingy and you're either too fast, (Wait a few seconds, because the free version only allows a few requests per minute.) or you've used up your free messages for the day in the free version. In that case, you either need to switch to the paid version or wait until tomorrow. I'm sorry! Sending you a big hug! <3";
+      } 
+      // Content-Filter-Fehler erkennen
+      else if (error.message?.includes('403') || error.message?.includes('PROHIBITED_CONTENT') || error.message?.includes('content policy')) {
+        errorMessage = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use the Jailbreaked Version /jbfree or /jbcash for NSWF/Violence.";
+      }
+      
+      // Fehler im Stream-Format an den Client senden
+      res.write(createStreamErrorMessage(errorMessage));
       res.end();
     });
   } catch (error) {
     console.error('Stream Handling Error:', error);
-    res.status(500).json({ error: 'Stream processing error' });
+    // Auch bei internen Fehlern eine freundliche Meldung senden
+    res.write(createStreamErrorMessage("A server error occurred. Please try again."));
+    res.end();
   }
 }
 
@@ -513,7 +534,8 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
 
     // Stream-Anfrage behandeln
     if (isStreamingRequested && response.data) {
-      return handleStreamResponse(response.data, res);
+      // Mit verbesserter Fehlerbehandlung und Modellnamen
+      return handleStreamResponse(response.data, res, modelName);
     }
 
     // Normale Antwort verarbeiten
@@ -701,8 +723,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '1.7.0',
-    info: 'GEMINI UNBLOCKER V.1.4 by Sophiamccarty',
+    version: '1.8.0',
+    info: 'GEMINI UNBLOCKER V.1.5 by Sophiamccarty',
     usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI WITH THINKING MODE',
     endpoints: {
       standard: '/nofilter',           // Standard-Route ohne Modellzwang
@@ -718,7 +740,7 @@ app.get('/', (req, res) => {
       streaming: 'Aktiviert',
       dynamicSafety: 'Optimiert für alle Gemini 2.5 Modelle (mit OFF-Setting)',
       jailbreak: 'Verfügbar über /jbfree, /jbcash und /jbnotfilter',
-      thinking: 'Automatisch aktiviert für unterstützte Modelle (Budget: 8192 Tokens)'
+      thinking: 'Aktiv für alle unterstützten Modelle auch mit Streaming (Budget: 8192 Tokens)'
     },
     thinkingModels: [
       'gemini-2.5-pro-preview-03-25',
@@ -738,8 +760,9 @@ app.get('/health', (req, res) => {
     memory: process.memoryUsage(),
     timestamp: new Date().toISOString(),
     features: {
-      thinking: 'Aktiviert für unterstützte Modelle',
+      thinking: 'Aktiviert für unterstützte Modelle auch im Stream-Modus',
       thinkingBudget: 8192,
+      streamFehlermeldungen: 'Verbessert für benutzerfreundliche Meldungen',
       endpoints: {
         total: 8,
         withThinking: 8,
@@ -757,5 +780,5 @@ app.get('/health', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Proxy läuft auf Port ${PORT}`);
-  console.log(`${new Date().toISOString()} - Server gestartet`);
+  console.log(`${new Date().toISOString()} - Server gestartet mit Thinking-Support für Streaming aktiviert`);
 });

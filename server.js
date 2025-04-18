@@ -1,4 +1,7 @@
-/*************************************************
+// NEUE ROUTE: "/25flash" - Gemini 2.5 Flash Modell mit Jailbreak
+app.post('/25flash', async (req, res) => {
+  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-flash-preview", true); // Jailbreak automatisch aktiviert
+});/*************************************************
  * server.js - Node/Express + Axios + CORS Proxy für JanitorAI
  *************************************************/
 const express = require('express');
@@ -482,10 +485,22 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
       // Log für erfolgreiche Thinking-Anwendung bei unterstützten Modellen
       // Hier loggen wir die tatsächlich genutzten Tokens, nicht das Budget
       if (supportsThinking(data.model) && response.data?.usage) {
-        // Bei Google-Modellen gibt es auch prompt_tokens und completion_tokens
-        // Wenn es prompt_eval_count gibt, ist das Google's thinking count
-        const thinkingTokens = response.data.usage.prompt_eval_count || 
-                             response.data.usage.prompt_tokens || 0;
+        // Bei Google-Modellen gibt es prompt_eval_count für Thinking-Tokens
+        let thinkingTokens = 0;
+        
+        // Mögliche Quellen für Thinking-Tokens in der Reihenfolge der Priorität
+        if (response.data.usage.prompt_eval_count !== undefined) {
+          thinkingTokens = response.data.usage.prompt_eval_count;
+          console.log("Thinking-Tokens aus prompt_eval_count erkannt");
+        } else if (response.data.usage.prompt_tokens !== undefined) {
+          // Prompt-Tokens enthalten sowohl Input als auch Thinking
+          // Wir schätzen Thinking als die Differenz zwischen prompt_tokens und 
+          // unserem geschätzten Input
+          const inputTokens = currentRequestState.contextTokens || 0;
+          const totalPromptTokens = response.data.usage.prompt_tokens;
+          thinkingTokens = Math.max(0, totalPromptTokens - inputTokens);
+          console.log(`Thinking-Tokens geschätzt: ${totalPromptTokens} - ${inputTokens} = ${thinkingTokens}`);
+        } 
         
         // Aktualisiere den Thinking-Status mit tatsächlichen Token-Anzahl
         logThinkingStatus(true, thinkingTokens);
@@ -885,9 +900,9 @@ app.post('/cash', async (req, res) => {
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25");
 });
 
-// NEUE ROUTE: "/25flashthinking" - Gemini 2.5 Flash Thinking Modell
+// NEUE ROUTE: "/25flashthinking" - Gemini 2.5 Flash Thinking Modell mit Jailbreak
 app.post('/25flashthinking', async (req, res) => {
-  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-flash-preview:thinking");
+  await handleProxyRequestWithModel(req, res, "google/gemini-2.5-flash-preview:thinking", true); // Jailbreak automatisch aktiviert
 });
 
 // NEUE ROUTE: "/jbfree" - Freies Modell mit Jailbreak
@@ -919,23 +934,24 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '2.0.0',
-    info: 'GEMINI UNBLOCKER V.2.0 by Sophiamccarty',
+    version: '2.1.0',
+    info: 'GEMINI UNBLOCKER V.2.1 by Sophiamccarty',
     usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI WITH THINKING MODE',
     endpoints: {
       standard: '/nofilter',           // Standard-Route ohne Modellzwang
       legacy: '/v1/chat/completions',  // Legacy-Route ohne Modellzwang
       free: '/free',                   // Route mit kostenlosem Gemini-Modell
       paid: '/cash',                   // Route mit kostenpflichtigem Gemini-Modell
-      flash: '/25flashthinking',      // Route mit Gemini 2.5 Flash Preview Thinking
+      flash: '/25flash',               // NEU: Gemini 2.5 Flash mit Jailbreak
+      flashThinking: '/25flashthinking', // NEU: Gemini 2.5 Flash Thinking mit Jailbreak
       freeJailbreak: '/jbfree',        // Route mit kostenlosem Modell und Jailbreak
       paidJailbreak: '/jbcash',        // Route mit kostenpflichtigem Modell und Jailbreak
       nofilterJailbreak: '/jbnofilter' // Route ohne Modellzwang mit Jailbreak
     },
     features: {
       streaming: 'Aktiviert + verbesserte Fehlermeldungen',
-      dynamicSafety: 'Optimiert für alle Gemini 2.5 Modelle (mit OFF-Setting)',
-      jailbreak: 'Verfügbar über /jbfree, /jbcash und /jbnofilter',
+      dynamicSafety: 'Optimiert für alle Gemini 2.5 Modelle (mit zusätzlichen Deaktivierungen für Flash)',
+      jailbreak: 'Verfügbar über /jbfree, /jbcash, /jbnofilter, /25flash und /25flashthinking',
       thinking: 'Aktiv für alle unterstützten Modelle auch mit Streaming (Budget: 8192 Tokens)',
       logging: 'Verbessert mit Status-Tracking und Token-Zählung'
     },
@@ -945,7 +961,13 @@ app.get('/', (req, res) => {
       'gemini-2.0-flash-thinking',
       'gemini-2.5-flash-preview:thinking',
       'gemini-2.5-flash-preview'
-    ]
+    ],
+    models: {
+      proFree: 'google/gemini-2.5-pro-exp-03-25:free',
+      proPaid: 'google/gemini-2.5-pro-preview-03-25',
+      flash: 'google/gemini-2.5-flash-preview',
+      flashThinking: 'google/gemini-2.5-flash-preview:thinking'
+    }
   });
 });
 
@@ -977,6 +999,9 @@ app.get('/health', (req, res) => {
 // Starte den Express-Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
+  console.log(`\n====================`);
   console.log(`Proxy läuft auf Port ${PORT}`);
   console.log(`${new Date().toISOString()} - Server gestartet mit verbessertem Logging und Fehlerbehandlung`);
+  console.log(`Flash-Modelle jetzt alle mit Jailbreak und verstärkten Filter-Deaktivierungen`);
+  console.log(`====================\n`);
 });

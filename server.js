@@ -560,7 +560,6 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
   let streamContent = "";  // Gesammelter Inhalt für Token-Schätzung
   let streamDebugInfo = []; // Debug-Informationen für Flash-Modelle
   let chunkCounter = 0;
-  let lastSentPosition = 0; // Position, bis zu der wir bereits gesendet haben
   
   // Spezielle Konfiguration für Flash-Modelle
   const isFlashModel = modelName.includes('flash');
@@ -596,59 +595,55 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
         
         streamHasData = true;
         
-          // SSE Format: "data: {...}\n\n"
-          // Extrahiere den JSON Teil aus dem SSE Format
-          const jsonMatches = chunkStr.match(/data: ({.*})/g);
-          if (jsonMatches) {
-            for (const match of jsonMatches) {
-              try {
-                // Isoliere den JSON-Teil
-                const jsonStr = match.replace(/^data: /, '');
-                
-                // Bei Flash-Modellen jeden JSON-Teil parsen & inkrementell senden
-                if (isFlashModel && jsonStr !== '[DONE]') {
-                  try {
-                    const jsonData = JSON.parse(jsonStr);
+        // SSE Format: "data: {...}\n\n"
+        // Extrahiere den JSON Teil aus dem SSE Format
+        const jsonMatches = chunkStr.match(/data: ({.*})/g);
+        if (jsonMatches) {
+          for (const match of jsonMatches) {
+            try {
+              // Isoliere den JSON-Teil
+              const jsonStr = match.replace(/^data: /, '');
+              
+              // Bei Flash-Modellen jeden JSON-Teil parsen & in Buffer speichern
+              if (isFlashModel && jsonStr !== '[DONE]') {
+                try {
+                  const jsonData = JSON.parse(jsonStr);
+                  
+                  // Extrahiere den Content aus dem Delta
+                  if (jsonData.choices && 
+                      jsonData.choices[0] && 
+                      jsonData.choices[0].delta && 
+                      jsonData.choices[0].delta.content) {
                     
-                    // Extrahiere den Content aus dem Delta
-                    if (jsonData.choices && 
-                        jsonData.choices[0] && 
-                        jsonData.choices[0].delta && 
-                        jsonData.choices[0].delta.content) {
-                      
-                      // Zum Gesamtinhalt hinzufügen
-                      streamContent += jsonData.choices[0].delta.content;
-                      
-                      // WICHTIGER FIX: Sende inkrementell kleine Teile statt alles zu buffern
-                      // Sende nur den neuen Teil als SSE
-                      const newContent = jsonData.choices[0].delta.content;
-                      const sseChunk = `data: {"choices":[{"delta":{"content":"${newContent.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"}}]}\n\n`;
-                      res.write(sseChunk);
-                      
-                      // Wenn Debugging aktiv ist, jedes 5. Chunk loggen
-                      if (debugMode && chunkCounter % 5 === 0) {
-                        console.log(`FLASH-CHUNK[${chunkCounter}]: Content sent, length=${newContent.length}`);
-                      }
-                    }
-                  } catch (err) {
-                    // Fehler beim Parsen ignorieren
-                    if (debugMode) {
-                      console.log(`PARSE-ERROR in chunk ${chunkCounter}: ${err.message}`);
+                    // Zum Buffer hinzufügen
+                    streamBuffer.choices[0].delta.content += jsonData.choices[0].delta.content;
+                    // Zum Inhalt für Token-Schätzung
+                    streamContent += jsonData.choices[0].delta.content;
+                    
+                    // Wenn Debugging aktiv ist, jedes 5. Chunk loggen
+                    if (debugMode && chunkCounter % 5 === 0) {
+                      console.log(`FLASH-CHUNK[${chunkCounter}]: Content received, current length=${streamContent.length}`);
                     }
                   }
-                } else {
-                  // Inhalt für Token-Schätzung sammeln  
-                  const contentMatch = jsonStr.match(/"content":"([^"]*)"/);
-                  if (contentMatch && contentMatch[1]) {
-                    streamContent += contentMatch[1];
+                } catch (err) {
+                  // Fehler beim Parsen ignorieren
+                  if (debugMode) {
+                    console.log(`PARSE-ERROR in chunk ${chunkCounter}: ${err.message}`);
                   }
                 }
-              } catch (err) {
-                // Ignoriere Fehler bei der JSON-Verarbeitung
-                console.error("Error processing JSON in chunk:", err);
+              } else {
+                // Inhalt für Token-Schätzung sammeln  
+                const contentMatch = jsonStr.match(/"content":"([^"]*)"/);
+                if (contentMatch && contentMatch[1]) {
+                  streamContent += contentMatch[1];
+                }
               }
+            } catch (err) {
+              // Ignoriere Fehler bei der JSON-Verarbeitung
+              console.error("Error processing JSON in chunk:", err);
             }
           }
+        }
         
         // Debug: Nach Fehlertypen in den Stream-Daten suchen
         if (chunkStr.includes('"error"') || 
@@ -687,9 +682,10 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
           return;
         }
         
-        // WICHTIG: Bei Flash-Modellen nur noch nicht direkt gesendeten Inhalt senden
+        // WICHTIG: Bei Flash-Modellen bauen wir den Stream neu, aber senden sofort weiter
         if (isFlashModel) {
-          // Bereits in der Event-Handler-Logik oben erledigt
+          // Flash-Modelle: Verarbeitung erfolgt während JSON-Extraktion
+          // Dort werden einzelne Chunks direkt in korrektem Format gesendet
         } else {
           // Nicht-Flash-Modelle: Normal weiterleiten
           res.write(chunk);
@@ -706,8 +702,11 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
         logErrorMessageSent(true);
         res.write(createStreamErrorMessage("The AI provider returned an empty response. Please try again."));
       } 
-      // Für Flash-Modelle: Prüfen, ob wir überhaupt Inhalt extrahieren konnten
+      // Für Flash-Modelle: prüfen ob Content extrahiert werden konnte
       else if (isFlashModel && streamContent.length === 0) {
+        // Flash Modell hat nichts zurückgegeben, aber Stream hatte Daten
+        console.log("DEBUG-FLASH: Stream hatte Daten, aber kein Content konnte extrahiert werden");
+        
         // Log Debug-Informationen
         if (debugMode) {
           console.log("FLASH-STREAM-DEBUG:", {
@@ -719,9 +718,6 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
           });
         }
         
-        // Flash Modell hat nichts zurückgegeben, aber Stream hatte Daten
-        console.log("DEBUG-FLASH: Stream hatte Daten, aber kein Content konnte extrahiert werden");
-        
         // Der OpenRouter-Response zeigt Tokens, aber wir können sie nicht lesen
         // Hier generieren wir einen synthetischen Antwortstream
         
@@ -731,17 +727,17 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
                               "which use Gemini Pro models that typically work more reliably.";
         
         // Als SSE formatieren und senden
-        res.write(`data: {"choices":[{"delta":{"content":"${syntheticContent.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"}}]}\n\n`);
+        res.write(`data: {"choices":[{"delta":{"content":"${syntheticContent}"}}]}\n\n`);
         
         logResponseStatus(true, estimateTokens(syntheticContent));
       } 
       else if (!streamErrorOccurred) {
-        // Erfolg markieren
+        // Als Erfolg markieren mit geschätzten Tokens
         const estimatedTokens = estimateTokens(streamContent);
         logResponseStatus(true, estimatedTokens);
       }
       
-      // Immer den Stream richtig beenden
+      // WICHTIG: Immer den Stream mit [DONE] beenden
       res.write('data: [DONE]\n\n');
       
       finalizeRequestLog();
@@ -1077,9 +1073,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '2.2.0',
-    info: 'GEMINI UNBLOCKER V.2.2 by Sophiamccarty',
-    usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI WITH THINKING MODE & ENHANCED JAILBREAK',
+    version: '2.3.0',
+    info: 'GEMINI UNBLOCKER V.2.3 by Sophiamccarty',
+    usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI WITH THINKING MODE & ENHANCED STREAMING',
     endpoints: {
       standard: '/nofilter',           // Standard-Route ohne Modellzwang
       legacy: '/v1/chat/completions',  // Legacy-Route ohne Modellzwang
@@ -1092,7 +1088,7 @@ app.get('/', (req, res) => {
       nofilterJailbreak: '/jbnofilter' // Route ohne Modellzwang mit Jailbreak
     },
     features: {
-      streaming: 'Aktiviert + verbesserte Fehlermeldungen',
+      streaming: 'Verbessert mit chunk-by-chunk Weiterleitung für Flash-Modelle',
       dynamicSafety: 'Optimiert für alle Gemini 2.5 Modelle (mit OFF-Setting)',
       jailbreak: 'Verstärkt für alle Modelle + automatisch für Flash-Modelle',
       thinking: 'Aktiv für alle unterstützten Modelle auch mit Streaming (Budget: 8192 Tokens)',

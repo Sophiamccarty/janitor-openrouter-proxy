@@ -1,6 +1,6 @@
 /*************************************************
  * server.js - Node/Express + Axios + CORS Proxy für JanitorAI
- * v1.7.0 - Verbesserte Safety Settings & Content-Filter-Erkennung
+ * v1.7.1 - Reasoning-Deaktivierung für Gemini 2.5 Pro Preview
  *************************************************/
 const express = require('express');
 const axios = require('axios');
@@ -393,6 +393,13 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
           x_title: 'JanitorAI' // Anpassen falls nötig
       }
     };
+    
+    // Für Gemini 2.5 Pro Preview das Reasoning (Denkprozess) deaktivieren
+    if (modelName === 'google/gemini-2.5-pro-preview-03-25') {
+      requestBody.thinkingBudget = 0; // Deaktiviert das Reasoning vollständig
+      console.log('Reasoning für Gemini 2.5 Pro Preview deaktiviert (thinkingBudget=0)');
+    }
+    
     if (isStreamingRequested) requestBody.stream = true;
     else delete requestBody.stream;
 
@@ -426,7 +433,7 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     const headers = {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${apiKey}`,
-      'User-Agent': 'JanitorAI-Proxy/1.7.0', // Version aktualisiert
+      'User-Agent': 'JanitorAI-Proxy/1.7.1', // Version aktualisiert
       'HTTP-Referer': 'https://janitorai.com',
       'X-Title': 'Janitor.ai'
     };
@@ -617,7 +624,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '1.7.0', // Aktualisierte Version
+    version: '1.7.1', // Aktualisierte Version
     info: 'GEMINI UNBLOCKER by Sophiamccarty',
     usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI via OpenRouter',
     endpoints: {
@@ -633,7 +640,8 @@ app.get('/', (req, res) => {
       streaming: 'Aktiviert (inkl. Fehler-Streaming)',
       dynamicSafety: 'Optimiert für Gemini Modelle (versucht OFF, fallback BLOCK_NONE)',
       jailbreak: 'Verfügbar über /jbfree, /jbcash, /jbnofilter, /flash25 Routen',
-      ooc_instruction: 'Zwei OOC Anweisungen automatisch an letzte User-Nachricht angehängt', // Updated Feature description
+      ooc_instruction: 'Zwei OOC Anweisungen automatisch an letzte User-Nachricht angehängt',
+      reasoningDisabled: 'Reasoning/Denkprozess für Gemini 2.5 Pro Preview deaktiviert (thinkingBudget=0)',
       models_tested_off: [
           'google/gemini-2.5-pro-preview-03-25',
           'google/gemini-2.5-pro-exp-03-25:free',
@@ -656,6 +664,6 @@ app.get('/health', (req, res) => {
 // Starte den Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Proxy Server v1.7.0 läuft auf Port ${PORT}`); // Version aktualisiert
+  console.log(`Proxy Server v1.7.1 läuft auf Port ${PORT}`); // Version aktualisiert
   console.log(`${new Date().toISOString()} - Server gestartet`);
 });

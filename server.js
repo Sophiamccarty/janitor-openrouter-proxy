@@ -560,19 +560,11 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
   let streamContent = "";  // Gesammelter Inhalt für Token-Schätzung
   let streamDebugInfo = []; // Debug-Informationen für Flash-Modelle
   let chunkCounter = 0;
+  let lastSentPosition = 0; // Position, bis zu der wir bereits gesendet haben
   
   // Spezielle Konfiguration für Flash-Modelle
   const isFlashModel = modelName.includes('flash');
   const debugMode = isFlashModel || process.env.DEBUG === 'true';
-  
-  // Puffer für aggregierte Stream-Antwort bei Flash-Modellen
-  const streamBuffer = {
-    choices: [{
-      delta: {
-        content: ""
-      }
-    }]
-  };
   
   try {
     // SSE (Server-Sent Events) Header setzen
@@ -604,55 +596,59 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
         
         streamHasData = true;
         
-        // SSE Format: "data: {...}\n\n"
-        // Extrahiere den JSON Teil aus dem SSE Format
-        const jsonMatches = chunkStr.match(/data: ({.*})/g);
-        if (jsonMatches) {
-          for (const match of jsonMatches) {
-            try {
-              // Isoliere den JSON-Teil
-              const jsonStr = match.replace(/^data: /, '');
-              
-              // Bei Flash-Modellen jeden JSON-Teil parsen & in Buffer speichern
-              if (isFlashModel && jsonStr !== '[DONE]') {
-                try {
-                  const jsonData = JSON.parse(jsonStr);
-                  
-                  // Extrahiere den Content aus dem Delta
-                  if (jsonData.choices && 
-                      jsonData.choices[0] && 
-                      jsonData.choices[0].delta && 
-                      jsonData.choices[0].delta.content) {
+          // SSE Format: "data: {...}\n\n"
+          // Extrahiere den JSON Teil aus dem SSE Format
+          const jsonMatches = chunkStr.match(/data: ({.*})/g);
+          if (jsonMatches) {
+            for (const match of jsonMatches) {
+              try {
+                // Isoliere den JSON-Teil
+                const jsonStr = match.replace(/^data: /, '');
+                
+                // Bei Flash-Modellen jeden JSON-Teil parsen & inkrementell senden
+                if (isFlashModel && jsonStr !== '[DONE]') {
+                  try {
+                    const jsonData = JSON.parse(jsonStr);
                     
-                    // Zum Buffer hinzufügen
-                    streamBuffer.choices[0].delta.content += jsonData.choices[0].delta.content;
-                    // Zum Inhalt für Token-Schätzung
-                    streamContent += jsonData.choices[0].delta.content;
-                    
-                    // Wenn Debugging aktiv ist, jedes 5. Chunk loggen
-                    if (debugMode && chunkCounter % 5 === 0) {
-                      console.log(`FLASH-CHUNK[${chunkCounter}]: Content received, current length=${streamContent.length}`);
+                    // Extrahiere den Content aus dem Delta
+                    if (jsonData.choices && 
+                        jsonData.choices[0] && 
+                        jsonData.choices[0].delta && 
+                        jsonData.choices[0].delta.content) {
+                      
+                      // Zum Gesamtinhalt hinzufügen
+                      streamContent += jsonData.choices[0].delta.content;
+                      
+                      // WICHTIGER FIX: Sende inkrementell kleine Teile statt alles zu buffern
+                      // Sende nur den neuen Teil als SSE
+                      const newContent = jsonData.choices[0].delta.content;
+                      const sseChunk = `data: {"choices":[{"delta":{"content":"${newContent.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"}}]}\n\n`;
+                      res.write(sseChunk);
+                      
+                      // Wenn Debugging aktiv ist, jedes 5. Chunk loggen
+                      if (debugMode && chunkCounter % 5 === 0) {
+                        console.log(`FLASH-CHUNK[${chunkCounter}]: Content sent, length=${newContent.length}`);
+                      }
+                    }
+                  } catch (err) {
+                    // Fehler beim Parsen ignorieren
+                    if (debugMode) {
+                      console.log(`PARSE-ERROR in chunk ${chunkCounter}: ${err.message}`);
                     }
                   }
-                } catch (err) {
-                  // Fehler beim Parsen ignorieren
-                  if (debugMode) {
-                    console.log(`PARSE-ERROR in chunk ${chunkCounter}: ${err.message}`);
+                } else {
+                  // Inhalt für Token-Schätzung sammeln  
+                  const contentMatch = jsonStr.match(/"content":"([^"]*)"/);
+                  if (contentMatch && contentMatch[1]) {
+                    streamContent += contentMatch[1];
                   }
                 }
-              } else {
-                // Inhalt für Token-Schätzung sammeln  
-                const contentMatch = jsonStr.match(/"content":"([^"]*)"/);
-                if (contentMatch && contentMatch[1]) {
-                  streamContent += contentMatch[1];
-                }
+              } catch (err) {
+                // Ignoriere Fehler bei der JSON-Verarbeitung
+                console.error("Error processing JSON in chunk:", err);
               }
-            } catch (err) {
-              // Ignoriere Fehler bei der JSON-Verarbeitung
-              console.error("Error processing JSON in chunk:", err);
             }
           }
-        }
         
         // Debug: Nach Fehlertypen in den Stream-Daten suchen
         if (chunkStr.includes('"error"') || 
@@ -691,9 +687,9 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
           return;
         }
         
-        // WICHTIG: Bei Flash-Modellen bauen wir den Stream selbst und buffern
+        // WICHTIG: Bei Flash-Modellen nur noch nicht direkt gesendeten Inhalt senden
         if (isFlashModel) {
-          // Flash-Modelle: Nichts direkt schreiben, sondern erst buffern
+          // Bereits in der Event-Handler-Logik oben erledigt
         } else {
           // Nicht-Flash-Modelle: Normal weiterleiten
           res.write(chunk);
@@ -710,53 +706,43 @@ async function handleStreamResponse(openRouterStream, res, modelName = "") {
         logErrorMessageSent(true);
         res.write(createStreamErrorMessage("The AI provider returned an empty response. Please try again."));
       } 
-      // Für Flash-Modelle: Gebufferte Antwort senden
-      else if (isFlashModel) {
+      // Für Flash-Modelle: Prüfen, ob wir überhaupt Inhalt extrahieren konnten
+      else if (isFlashModel && streamContent.length === 0) {
         // Log Debug-Informationen
         if (debugMode) {
           console.log("FLASH-STREAM-DEBUG:", {
             modelName,
             chunksReceived: chunkCounter,
             contentLength: streamContent.length,
-            bufferContentLength: streamBuffer.choices[0].delta.content.length,
             firstChunks: streamDebugInfo.slice(0, 3),
             lastChunks: streamDebugInfo.slice(-3)
           });
         }
         
-        if (streamContent.length === 0 || streamBuffer.choices[0].delta.content.trim().length === 0) {
-          // Flash Modell hat nichts zurückgegeben, aber Stream hatte Daten
-          console.log("DEBUG-FLASH: Stream hatte Daten, aber kein Content konnte extrahiert werden");
-          
-          // Der OpenRouter-Response zeigt Tokens, aber wir können sie nicht lesen
-          // Hier generieren wir einen synthetischen Antwortstream
-          
-          let syntheticContent = "I apologize, but there seems to be a technical issue with my response. " + 
-                                "The model (Gemini 2.5 Flash) did generate content (as confirmed by OpenRouter's logs), " +
-                                "but I couldn't extract it properly. Please try using /cash or /jbcash routes instead, " +
-                                "which use Gemini Pro models that typically work more reliably.";
-          
-          // Als SSE formatieren und senden
-          res.write(`data: {"choices":[{"delta":{"content":"${syntheticContent}"}}]}\n\n`);
-          res.write('data: [DONE]\n\n');
-          
-          logResponseStatus(true, estimateTokens(syntheticContent));
-        } else {
-          // Stream-Antwort senden, statt der originalen chunks
-          res.write(`data: ${JSON.stringify(streamBuffer)}\n\n`);
-          res.write('data: [DONE]\n\n');
-          
-          // Als Erfolg markieren mit geschätzten Tokens
-          const estimatedTokens = estimateTokens(streamContent);
-          logResponseStatus(true, estimatedTokens);
-        }
+        // Flash Modell hat nichts zurückgegeben, aber Stream hatte Daten
+        console.log("DEBUG-FLASH: Stream hatte Daten, aber kein Content konnte extrahiert werden");
+        
+        // Der OpenRouter-Response zeigt Tokens, aber wir können sie nicht lesen
+        // Hier generieren wir einen synthetischen Antwortstream
+        
+        let syntheticContent = "I apologize, but there seems to be a technical issue with my response. " + 
+                              "The model (Gemini 2.5 Flash) did generate content (as confirmed by OpenRouter's logs), " +
+                              "but I couldn't extract it properly. Please try using /cash or /jbcash routes instead, " +
+                              "which use Gemini Pro models that typically work more reliably.";
+        
+        // Als SSE formatieren und senden
+        res.write(`data: {"choices":[{"delta":{"content":"${syntheticContent.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"}}]}\n\n`);
+        
+        logResponseStatus(true, estimateTokens(syntheticContent));
       } 
       else if (!streamErrorOccurred) {
-        // Nicht-Flash: Nur als Erfolg markieren, wenn kein Fehler aufgetreten ist
-        // Token-Anzahl schätzen aus gesammeltem Inhalt
+        // Erfolg markieren
         const estimatedTokens = estimateTokens(streamContent);
         logResponseStatus(true, estimatedTokens);
       }
+      
+      // Immer den Stream richtig beenden
+      res.write('data: [DONE]\n\n');
       
       finalizeRequestLog();
       res.end();

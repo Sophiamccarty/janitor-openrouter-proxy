@@ -1210,9 +1210,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '2.9.0',
-    info: 'GEMINI UNBLOCKER V.2.9 by Sophiamccarty',
-    usage: 'SIMULIERTES STREAMING CONTINUATION, ANTI-PGSHAG2',
+    version: '3.0.0',
+    info: 'GEMINI UNBLOCKER V.3.0 by Sophiamccarty',
+    usage: 'NAHTLOSE FORTSETZUNG OHNE STREAM-UNTERBRECHUNG',
     endpoints: {
       standard: '/nofilter',
       legacy: '/v1/chat/completions',
@@ -1233,7 +1233,7 @@ app.get('/', (req, res) => {
       logging: 'Verbessert mit Status-Tracking und tatsächlicher Token-Nutzung',
       flashTokenLimit: 'Max 1024 Tokens für Flash-Modelle (verbesserte Stabilität)',
       autoJailbreak: 'Automatisch aktiviert für alle Flash-Modelle',
-      autoContinuation: 'Simuliertes Chunk-Streaming für maximale Kompatibilität'
+      seamlessContinuation: 'Nahtlose Fortsetzung ohne Stream-Unterbrechung'
     },
     thinkingModels: [
       'gemini-2.5-pro-preview-03-25',
@@ -1262,7 +1262,7 @@ app.get('/health', (req, res) => {
       thinkingBudget: 8192,
       streamHandler: 'Maximal vereinfacht für 100% Stabilität',
       streamTimeout: '10 Sekunden Timeout bei fehlenden Daten',
-      continuationMode: 'Simuliertes Chunk-Streaming für maximale Kompatibilität',
+      continuationMode: 'Nahtlose Fortsetzung ohne Stream-Unterbrechung',
       logging: 'Zeigt tatsächlich verwendete Tokens an',
       autoJailbreak: 'Aktiviert für alle Flash-Modelle',
       flashTokenLimit: 'Auf 1024 beschränkt für Stabilität',
@@ -1283,5 +1283,5 @@ app.get('/health', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Proxy läuft auf Port ${PORT}`);
-  console.log(`${new Date().toISOString()} - Server gestartet mit simuliertem Streaming für Auto-Continuation`);
+  console.log(`${new Date().toISOString()} - Server gestartet mit nahtloser Stream-Fortsetzung ohne Unterbrechung V3.0`);
 });

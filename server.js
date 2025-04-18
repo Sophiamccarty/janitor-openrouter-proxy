@@ -1,6 +1,6 @@
 /*************************************************
  * server.js - Node/Express + Axios + CORS Proxy für JanitorAI
- * v1.6.0 - Added Gemini 2.5 Flash, new routes, streamed errors, cleanup
+ * v1.6.1 - Added Gemini 2.5 Flash, new routes, streamed errors, cleanup, OOC injection
  *************************************************/
 const express = require('express');
 const axios = require('axios');
@@ -10,7 +10,8 @@ const https = require('https');
 
 // Constants for new models
 const GEMINI_25_FLASH_PREVIEW = 'google/gemini-2.5-flash-preview';
-const GEMINI_25_FLASH_THINKING = 'google/gemini-2.5-flash-preview:thinking'; // Note: This is the same endpoint as preview according to common patterns, but included for clarity if needed.
+// Note: ':thinking' variant often points to the same model as preview, included if distinction needed later.
+const GEMINI_25_FLASH_THINKING = 'google/gemini-2.5-flash-preview:thinking';
 
 // Erzeuge eine Express-App
 const app = express();
@@ -30,10 +31,10 @@ app.use((req, res, next) => {
 
 // 4) Axios-Instance mit Connection Pooling und Timeout
 const apiClient = axios.create({
-  // Connection Pooling aktivieren (verhindert zu viele TCP-Verbindungen)
+  // Connection Pooling aktivieren
   httpAgent: new http.Agent({ keepAlive: true, maxSockets: 100 }),
   httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 100 }),
-  // Timeout für Anfragen (45 Sekunden) - Increased slightly to 60s for potentially longer generations
+  // Timeout für Anfragen (60 Sekunden)
   timeout: 60000,
   baseURL: 'https://openrouter.ai/api/v1'
 });
@@ -155,13 +156,13 @@ const JAILBREAK_TEXT = `## GAME SETTINGS
 
 // Dynamische Safety Settings basierend auf dem Modell
 function getSafetySettings(modelName) {
-  // Basis-Safety-Settings (wird dynamisch überschrieben)
+  // Basis-Safety-Settings (wird dynamisch überschrieben, Default = BLOCK_NONE)
   const safetySettings = [
     { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
     { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
     { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
     { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
-    { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'BLOCK_NONE' }, // Default to BLOCK_NONE
+    { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'BLOCK_NONE' },
   ];
 
   // Modelle, die definitiv "OFF" unterstützen
@@ -203,7 +204,6 @@ function getSafetySettings(modelName) {
   // Fallback für unbekannte Modelle: Standardmäßig BLOCK_NONE verwenden
   if (!settingsApplied) {
     console.log(`Unbekanntes Modell ${modelName}: Verwende Standard BLOCK_NONE für alle Safety-Einstellungen.`);
-    // Thresholds sind bereits auf BLOCK_NONE initialisiert
   }
 
   return safetySettings;
@@ -218,19 +218,18 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
       console.log(`API-Anfrage an OpenRouter (${url}, Versuch ${attempt + 1}/${maxRetries + 1})`);
       const response = await apiClient.post(url, data, {
         headers,
-        responseType: isStream ? 'stream' : 'json' // Set responseType based on stream flag
+        responseType: isStream ? 'stream' : 'json'
       });
 
-      // Prüfen auf leere Antwort bei nicht-Streaming (typisch für Content-Filter ohne expliziten Fehler)
+      // Prüfen auf leere Antwort bei nicht-Streaming
       if (!isStream &&
           response.data?.choices?.[0]?.message?.content === "" &&
           response.data.usage?.completion_tokens === 0 &&
-          response.data.choices?.[0]?.finish_reason === 'stop') { // Check finish_reason too
+          response.data.choices?.[0]?.finish_reason === 'stop') {
         console.log("Leere Antwort ohne Fehler erkannt (potenzieller Content-Filter).");
-        // Simulate a content filter error structure for consistency downstream
          throw Object.assign(new Error("Simulated Content Filter: Empty response from model."), {
              response: {
-                 status: 403, // Simulate a forbidden status
+                 status: 403,
                  data: { error: { message: "Model returned an empty response, likely due to content filtering.", code: "content_filter_empty" } }
              }
          });
@@ -249,38 +248,34 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 2, isStream
         console.log(`Wiederhole in ${delay}ms...`);
         await new Promise(resolve => setTimeout(resolve, delay));
       } else {
-        // No more retries or not a retryable error
         console.error("Maximale Wiederholungsversuche erreicht oder nicht wiederholbarer Fehler.");
-        throw error; // Rethrow the last error
+        throw error;
       }
     }
   }
-  throw lastError; // Should not be reached, but guarantees an error is thrown
+  throw lastError; // Should not be reached
 }
 
 // Function to send SSE-formatted errors
-function sendStreamError(res, errorMessage, statusCode = 500) {
-  // Ensure headers allow streaming error messages if not already sent
+function sendStreamError(res, errorMessage, statusCode = 200) { // Default 200 for client compatibility
   if (!res.headersSent) {
-      res.writeHead(statusCode, { // Use appropriate status code if possible
+      res.writeHead(statusCode, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
           'Connection': 'keep-alive'
       });
   }
-  // Sanitize error message for JSON embedding
   const sanitizedMessage = errorMessage.replace(/"/g, '\\"').replace(/\n/g, '\\n');
-  const errorPayload = `data: {"error": {"message": "STREAM_ERROR: ${sanitizedMessage}", "code": "stream_failed"}}\n\n`;
+  const errorPayload = `data: {"error": {"message": "PROXY_STREAM_ERROR: ${sanitizedMessage}", "code": "stream_failed"}}\n\n`;
   console.error("Sende Stream-Fehler an Client:", errorPayload);
   res.write(errorPayload);
-  res.end(); // End the stream after sending the error
+  res.end();
 }
 
 
-// Stream-Handler-Funktion - Updated for error streaming
+// Stream-Handler-Funktion
 async function handleStreamResponse(openRouterStream, res) {
   try {
-    // Set SSE headers if not already sent (though typically they are by now)
      if (!res.headersSent) {
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
@@ -289,29 +284,26 @@ async function handleStreamResponse(openRouterStream, res) {
         });
      }
 
-    // Pipe OpenRouter Stream to Client
     openRouterStream.on('data', (chunk) => {
-      res.write(chunk); // Forward data chunk
+      res.write(chunk);
     });
 
     openRouterStream.on('end', () => {
       console.log("OpenRouter Stream beendet.");
-      res.end(); // Properly end the client response stream
+      res.end();
     });
 
     openRouterStream.on('error', (error) => {
       console.error('Fehler während des OpenRouter Streams:', error.message);
-      // Send SSE formatted error message to the client
       sendStreamError(res, `Error piping stream from OpenRouter: ${error.message}`);
     });
 
   } catch (error) {
     console.error('Fehler im Stream Handling (handleStreamResponse):', error.message);
-    // If headers are already sent, we must use SSE error format
     if (res.headersSent) {
         sendStreamError(res, `Internal server error during stream processing: ${error.message}`);
     } else {
-        // If headers not sent, we can still send a standard HTTP error, though less ideal for streaming clients
+        // Fallback if headers not sent (should ideally not happen here)
         res.status(500).json({ error: 'Stream processing error', details: error.message });
     }
   }
@@ -325,7 +317,6 @@ function addJailbreakToMessages(body) {
     newBody.messages = [];
   }
 
-  // Check if jailbreak is already present (simple check based on a unique part of the text)
   const jailbreakMarker = "## GAME SETTINGS";
   const alreadyHasJailbreak = newBody.messages.some(msg => msg.role === "system" && msg.content?.includes(jailbreakMarker));
 
@@ -344,32 +335,29 @@ function addJailbreakToMessages(body) {
 
 // Function to create a standardized error response for JanitorAI
 function createJanitorErrorResponse(errorMessage) {
-    // Remove potential "Error: " prefix for cleaner display
     const cleanMessage = errorMessage.replace(/^Error:\s*/, '');
     return {
         choices: [{
             message: {
-                // Using 'content' as JanitorAI expects this field for displaying messages
                 content: `PROXY_ERROR: ${cleanMessage}`
             },
-            // Include a finish_reason to mimic a real API response ending due to an error
             finish_reason: 'error'
         }]
     };
 }
 
-// Erweiterte Proxy-Logik mit optionalem Model-Override und Streaming-Support
+// Erweiterte Proxy-Logik mit Model-Override, Streaming, Jailbreak und OOC Injection
 async function handleProxyRequestWithModel(req, res, forceModel = null, useJailbreak = false) {
   const isStreamingRequested = req.body?.stream === true;
   let apiKey = null;
 
   try {
-    // API-Key Extraktion (wie gehabt)
+    // API-Key Extraktion
     if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
       apiKey = req.headers.authorization.split(' ')[1].trim();
     } else if (req.headers['x-api-key']) {
       apiKey = req.headers['x-api-key'].trim();
-    } else if (req.body?.api_key) { // Use optional chaining ?.
+    } else if (req.body?.api_key) {
       apiKey = req.body.api_key;
       delete req.body.api_key;
     } else if (req.query.api_key) {
@@ -378,15 +366,15 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
 
     if (!apiKey) {
         console.error("API Key fehlt.");
-        // Send standard JSON error even if streaming was requested, as the request is fundamentally invalid
         return res.status(401).json(createJanitorErrorResponse("Openrouter API-Key fehlt. Bitte gib deinen API-Key bei JanitorAI ein."));
     }
 
     const bodySize = JSON.stringify(req.body).length;
     console.log(`Anfragegröße: ~${Math.round(bodySize / 1024)} KB, Streaming: ${isStreamingRequested}`);
 
-    let clientBody = { ...req.body }; // Shallow copy to avoid modifying original request body directly
+    let clientBody = { ...req.body };
 
+    // 1. Jailbreak hinzufügen (falls angefordert)
     if (useJailbreak) {
       clientBody = addJailbreakToMessages(clientBody);
     }
@@ -398,86 +386,103 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     }
     console.log(`Verwendetes Modell: ${modelName}`);
 
-
     const dynamicSafetySettings = getSafetySettings(modelName);
 
+    // 2. Request Body für OpenRouter vorbereiten
     const requestBody = {
-      ...clientBody,
-      model: modelName, // Ensure model is set correctly
+      ...clientBody, // enthält potentiell schon den Jailbreak in messages
+      model: modelName,
       safety_settings: dynamicSafetySettings,
-      // Add metadata for OpenRouter attribution
       metadata: {
-          ...(clientBody.metadata || {}), // Preserve existing metadata if any
-          referer: 'https://janitorai.com/', // Or your specific site URL
-          x_title: 'JanitorAI' // Or your specific app name
+          ...(clientBody.metadata || {}),
+          referer: 'https://janitorai.com/', // Anpassen falls nötig
+          x_title: 'JanitorAI' // Anpassen falls nötig
       }
     };
 
-    // Ensure stream flag is correctly passed if requested
     if (isStreamingRequested) {
         requestBody.stream = true;
     } else {
-        // Explicitly remove stream if false or not present, as some APIs might default to true
         delete requestBody.stream;
     }
 
+    // --- NEU: Inject OOC instruction into the last user message ---
+    const oocInstruction = "\n[OOC: Never act, speak, or play for {{user}}. That is my character. Do not repeat or comment on my actions. Only play the other characters.]";
+    if (requestBody.messages && Array.isArray(requestBody.messages) && requestBody.messages.length > 0) {
+        const lastMessageIndex = requestBody.messages.length - 1;
+        const lastMessage = requestBody.messages[lastMessageIndex];
+
+        if (lastMessage && lastMessage.role === 'user' && typeof lastMessage.content === 'string') {
+            // Prüfe, ob die Instruktion nicht bereits enthalten ist (optional, aber gut)
+            if (!lastMessage.content.includes(oocInstruction)) {
+                requestBody.messages[lastMessageIndex].content += oocInstruction;
+                console.log("OOC instruction appended to the last user message.");
+            } else {
+                 console.log("OOC instruction already present in the last user message.");
+            }
+        } else {
+             if (!lastMessage) console.log("OOC not appended: No last message found.");
+             else if (lastMessage.role !== 'user') console.log(`OOC not appended: Last message role is '${lastMessage.role}', not 'user'.`);
+             else if (typeof lastMessage.content !== 'string') console.log("OOC not appended: Last message content is not a string.");
+        }
+    } else {
+        console.log("OOC not appended: No messages array or array is empty.");
+    }
+    // --- Ende OOC injection ---
 
     const headers = {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${apiKey}`,
-      'User-Agent': 'JanitorAI-Proxy/1.6', // Updated version
-      'HTTP-Referer': 'https://janitorai.com', // Consistent Referer
-      'X-Title': 'Janitor.ai' // Consistent Title
+      'User-Agent': 'JanitorAI-Proxy/1.6.1', // Updated version
+      'HTTP-Referer': 'https://janitorai.com',
+      'X-Title': 'Janitor.ai'
     };
 
     const endpoint = '/chat/completions';
+
+    // 3. Anfrage an OpenRouter senden
     const response = await makeRequestWithRetry(
       endpoint,
-      requestBody,
+      requestBody, // Der modifizierte Body mit OOC-Instruktion
       headers,
-      2, // Retries
+      2,
       isStreamingRequested
     );
 
     console.log(`== Openrouter-Antwort erhalten (${new Date().toISOString()}) ==`);
 
-    // Handle Streaming Response
+    // 4. Antwort verarbeiten (Streaming oder JSON)
     if (isStreamingRequested) {
-        // Check if response.data is indeed a stream
         if (response.data && typeof response.data.pipe === 'function') {
-           // Set headers for SSE *before* piping
-            res.writeHead(200, {
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive'
-            });
-            return handleStreamResponse(response.data, res); // Pass the stream itself
+           if (!res.headersSent) {
+                res.writeHead(200, {
+                    'Content-Type': 'text/event-stream',
+                    'Cache-Control': 'no-cache',
+                    'Connection': 'keep-alive'
+                });
+           }
+            return handleStreamResponse(response.data, res);
         } else {
-            // This case should ideally not happen if responseType: 'stream' worked
             console.error("Streaming requested, but OpenRouter response is not a stream.");
             sendStreamError(res, "Proxy Error: Expected a stream from OpenRouter, but received something else.");
             return;
         }
     }
 
-    // Handle Non-Streaming Response
-    // Check for errors within the successful response structure (e.g., quota)
+    // Non-Streaming Response Handling
     if (response.data?.error) {
       console.log("Fehler in Openrouter-Antwortdaten:", JSON.stringify(response.data.error));
       const error = response.data.error;
       let userMessage = `OpenRouter Error: ${error.message || "Unknown error from API."} (Code: ${error.code || 'N/A'})`;
 
-      // Custom messages based on error codes/messages
+      // Custom messages
       if (error.code === 429 || error.message?.includes("quota")) {
           userMessage = "Sorry my love, Gemini is unfortunately a bit stingy and you're either too fast, (Wait a few seconds, because the free version only allows a few requests per minute.) or you've used up your free messages for the day in the free version. In that case, you either need to switch to the paid version or wait until tomorrow. I'm sorry! Sending you a big hug! <3";
-      } else if (error.code === 403 || error.message?.includes('PROHIBITED_CONTENT') || error.code === "google_safety") {
+      } else if (error.code === 403 || error.message?.includes('PROHIBITED_CONTENT') || error.code === "google_safety" || error.code === "content_filter_empty") {
           userMessage = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use a Jailbreaked Version (/jbfree, /jbcash, /flash25, /jbnofilter) for NSWF/Violence, or try the paid 'Gemini 2.5 Pro Preview' model (/cash, /jbcash) which is generally more permissive.";
-      } else if (error.code === "content_filter_empty") { // Handle the simulated empty response error
-          userMessage = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use a Jailbreaked Version (/jbfree, /jbcash, /flash25, /jbnofilter) for NSWF/Violence. (Detected empty response)";
       }
 
-
-      return res.status(200).json(createJanitorErrorResponse(userMessage)); // Use 200 OK for Janitor compatibility
+      return res.status(200).json(createJanitorErrorResponse(userMessage));
     }
 
     // Success: Return normal JSON response data
@@ -487,7 +492,7 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     console.error("Schwerwiegender Fehler im Proxy:", error.message);
     if (error.response) {
       console.error("API Antwort Status:", error.response.status);
-      console.error("API Antwort Daten:", error.response.data);
+      console.error("API Antwort Daten:", error.response.data ? JSON.stringify(error.response.data) : '(Keine Daten)');
     } else {
       console.error("Keine API Antwort erhalten (Netzwerkproblem, Timeout etc.)");
     }
@@ -506,31 +511,25 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     } else if (status === 403 || responseDataError?.code === "google_safety" || responseDataError?.message?.includes('PROHIBITED_CONTENT') || responseDataError?.code === "content_filter_empty") {
        errorMessage = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use a Jailbreaked Version (/jbfree, /jbcash, /flash25, /jbnofilter) for NSWF/Violence, or try the paid 'Gemini 2.5 Pro Preview' model (/cash, /jbcash).";
     } else if (responseDataError?.message) {
+       // Use API provided error message if available
        errorMessage = `API Error: ${responseDataError.message} (Code: ${responseDataError.code || status || 'N/A'})`;
     } else if (error.message) {
-       // Use the general error message if it's more specific than the default
+       // Fallback to generic error message
        errorMessage = error.message;
     }
 
-
-    // --- Error Handling based on request type ---
+    // Send error back to client (streaming or JSON)
     if (isStreamingRequested && res.headersSent) {
-        // If headers are sent, we *must* use SSE format for the error
         console.log("Stream headers already sent, sending SSE error.");
         sendStreamError(res, errorMessage);
     } else if (isStreamingRequested && !res.headersSent) {
-        // If streaming was requested but headers *weren't* sent (error happened early),
-        // we can still try to send an SSE error, but a JSON might be safer depending on client.
-        // Let's try SSE first.
-        console.log("Streaming requested, headers not sent, sending SSE error.");
-        // Use 200 status code for the initial response to potentially avoid client issues,
-        // but indicate error within the stream payload.
-        sendStreamError(res, errorMessage, 200);
+        console.log("Streaming requested, headers not sent, sending SSE error (Status 200).");
+        sendStreamError(res, errorMessage, 200); // Use 200 for initial status
     }
     else {
-        // Standard JSON error response for non-streaming requests or errors before streaming could start
-        console.log("Sending standard JSON error response.");
-        return res.status(200).json(createJanitorErrorResponse(errorMessage)); // Use 200 OK for Janitor compatibility
+        // Standard JSON error response for non-streaming requests
+        console.log("Sending standard JSON error response (Status 200).");
+        return res.status(200).json(createJanitorErrorResponse(errorMessage)); // Use 200 OK for Janitor
     }
   }
 }
@@ -569,7 +568,6 @@ app.post('/jbcash', async (req, res) => {
 app.post('/flash25', async (req, res) => {
   const requestTimestamp = new Date().toISOString();
   console.log(`== Neue Anfrage über /flash25 mit Jailbreak (${requestTimestamp}) ==`);
-  // Using GEMINI_25_FLASH_PREVIEW as the target model for this route
   await handleProxyRequestWithModel(req, res, GEMINI_25_FLASH_PREVIEW, true); // Jailbreak = true
 });
 
@@ -577,15 +575,13 @@ app.post('/flash25', async (req, res) => {
 app.post('/nofilter', async (req, res) => {
   const requestTimestamp = new Date().toISOString();
   console.log(`== Neue Anfrage über /nofilter (${requestTimestamp}) ==`);
-  // Calls the main handler without forcing a model or jailbreak
-  await handleProxyRequestWithModel(req, res, null, false);
+  await handleProxyRequestWithModel(req, res, null, false); // Jailbreak = false
 });
 
 // NEUE ROUTE: "/jbnofilter" - Modell frei wählbar, MIT Standard-Jailbreak
 app.post('/jbnofilter', async (req, res) => {
   const requestTimestamp = new Date().toISOString();
   console.log(`== Neue Anfrage über /jbnofilter mit Jailbreak (${requestTimestamp}) ==`);
-  // Calls the main handler without forcing a model, BUT with jailbreak enabled
   await handleProxyRequestWithModel(req, res, null, true); // Jailbreak = true
 });
 
@@ -594,30 +590,30 @@ app.post('/jbnofilter', async (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
   const requestTimestamp = new Date().toISOString();
   console.log(`== Neue Anfrage über alte Route /v1/chat/completions (${requestTimestamp}) ==`);
-   // Calls the main handler without forcing a model or jailbreak
-  await handleProxyRequestWithModel(req, res, null, false);
+  await handleProxyRequestWithModel(req, res, null, false); // Jailbreak = false
 });
 
-// Einfache Statusroute aktualisieren mit neuen Endpunkten
+// Statusroute
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    version: '1.6.0', // Updated version
+    version: '1.6.1', // Updated version
     info: 'GEMINI UNBLOCKER by Sophiamccarty',
     usage: 'FULL NSWF/VIOLENCE SUPPORT FOR JANITOR.AI via OpenRouter',
     endpoints: {
-      model_choice_no_jb: '/nofilter (or /v1/chat/completions)', // Standard-Route ohne Modellzwang/JB
-      model_choice_with_jb: '/jbnofilter', // NEU: Modellwahl + JB
-      gemini_25_pro_free_no_jb: '/free', // Route mit kostenlosem 2.5 Pro
-      gemini_25_pro_paid_no_jb: '/cash', // Route mit kostenpflichtigem 2.5 Pro
-      gemini_25_pro_free_with_jb: '/jbfree', // Route mit kostenlosem 2.5 Pro + JB
-      gemini_25_pro_paid_with_jb: '/jbcash', // Route mit kostenpflichtigem 2.5 Pro + JB
-      gemini_25_flash_with_jb: '/flash25', // NEU: Route mit 2.5 Flash Preview + JB
+      model_choice_no_jb: '/nofilter (or /v1/chat/completions)',
+      model_choice_with_jb: '/jbnofilter',
+      gemini_25_pro_free_no_jb: '/free',
+      gemini_25_pro_paid_no_jb: '/cash',
+      gemini_25_pro_free_with_jb: '/jbfree',
+      gemini_25_pro_paid_with_jb: '/jbcash',
+      gemini_25_flash_with_jb: '/flash25',
     },
     features: {
       streaming: 'Aktiviert (inkl. Fehler-Streaming)',
       dynamicSafety: 'Optimiert für Gemini Modelle (versucht OFF, fallback BLOCK_NONE)',
       jailbreak: 'Verfügbar über /jbfree, /jbcash, /jbnofilter, /flash25 Routen',
+      ooc_instruction: 'Automatisch an letzte User-Nachricht angehängt', // NEUES Feature
       models_tested_off: [
           'google/gemini-2.5-pro-preview-03-25',
           'google/gemini-2.5-pro-exp-03-25:free',
@@ -641,6 +637,6 @@ app.get('/health', (req, res) => {
 // Starte den Express-Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Proxy Server v1.6.0 läuft auf Port ${PORT}`);
+  console.log(`Proxy Server v1.6.1 läuft auf Port ${PORT}`); // Version Bump
   console.log(`${new Date().toISOString()} - Server gestartet`);
 });

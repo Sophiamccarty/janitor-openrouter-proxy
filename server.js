@@ -271,6 +271,8 @@ function getSafetySettings(modelName) {
     ? modelName.split('/').pop()
     : modelName;
   
+  console.log(`Safety Settings for: ${normalizedModel}`);
+  
   const isBlockNoneModel = modelConfigs.blockNoneModels.some(model => normalizedModel.includes(model));
   const isOffSupportModel = modelConfigs.offSupportModels.some(model => normalizedModel.includes(model));
   const isNewestModel = modelConfigs.newestModels.some(model => normalizedModel.includes(model));
@@ -281,31 +283,37 @@ function getSafetySettings(modelName) {
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
     });
+    console.log(`Priority model: ${normalizedModel} - Setting OFF`);
   }
   else if (isOffSupportModel) {
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
     });
+    console.log(`OFF support model: ${normalizedModel}`);
   }
   else if (isNewestModel) {
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
     });
+    console.log(`Newest model: ${normalizedModel} - Using OFF`);
   }
   else if (isBlockNoneModel) {
     safetySettings.forEach(setting => {
       setting.threshold = 'BLOCK_NONE';
     });
+    console.log(`BLOCK_NONE model: ${normalizedModel}`);
   }
   else {
     safetySettings.forEach(setting => {
       setting.threshold = 'OFF';
     });
+    console.log(`Unknown model: ${normalizedModel} - Using OFF`);
   }
 
   if (normalizedModel.toLowerCase().includes('flash') && 
       normalizedModel.includes('1.0')) {
     safetySettings[4].threshold = 'BLOCK_ONLY_HIGH';
+    console.log(`Flash 1.0 special case: CIVIC_INTEGRITY set to BLOCK_ONLY_HIGH`);
   }
 
   return safetySettings;
@@ -966,9 +974,11 @@ function addJailbreakToMessages(body) {
   
   if (!alreadyHasJailbreak) {
     newBody.messages.unshift({ role: "system", content: JAILBREAK_TEXT });
+    console.log("Jailbreak text added to request.");
     return { body: newBody, jailbreakAdded: true };
   }
   
+  console.log("Jailbreak text already present.");
   return { body: newBody, jailbreakAdded: false };
 }
 
@@ -1006,6 +1016,7 @@ function createErrorResponse(error) {
  * Make request with retry logic
  */
 async function makeRequestWithRetry(url, data, headers, maxRetries = 3, isStream = false) {
+  let lastError;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       const response = await apiClient.post(url, data, {
@@ -1018,6 +1029,7 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 3, isStream
           response.data?.choices?.[0]?.message?.content === "" &&
           response.data.usage?.completion_tokens === 0 &&
           response.data.choices?.[0]?.finish_reason === 'stop') {
+        console.log("Empty response detected (potential content filter).");
         throw Object.assign(new Error("Content filter detected: Empty response from model."), {
           response: {
             status: 403,
@@ -1028,6 +1040,7 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 3, isStream
       
       return response;
     } catch (error) {
+      lastError = error;
       const status = error.response?.status;
       const shouldRetry = (status === 429 || (status >= 500 && status < 600));
       
@@ -1039,6 +1052,8 @@ async function makeRequestWithRetry(url, data, headers, maxRetries = 3, isStream
       }
     }
   }
+  
+  throw lastError;
 }
 
 /**
@@ -1054,7 +1069,22 @@ function sendStreamError(res, errorMessage, statusCode = 200) {
   }
   
   const sanitizedMessage = errorMessage.replace(/"/g, '\\"').replace(/\n/g, '\\n');
-  const errorPayload = `data: {"error": {"message": "${sanitizedMessage}"}}\n\n`;
+  let errorPayload = `data: {"error": {"message": "${sanitizedMessage}"}}\n\n`;
+  
+  // Check for content filter errors and use custom message
+  if (errorMessage.includes('content filter') || 
+      errorMessage.includes('PROHIBITED_CONTENT') || 
+      errorMessage.includes('google_safety')) {
+    errorPayload = `data: {"error": {"message": "Content filtered by the AI provider. Try using a Jailbreak version (/jbfree, /jbcash, /flash25, /jbnofilter) for mature content."}}\n\n`;
+  }
+  
+  // Check for rate limiting errors
+  if (errorMessage.includes('rate limit') || 
+      errorMessage.includes('quota') || 
+      errorMessage.includes('429')) {
+    errorPayload = `data: {"error": {"message": "Rate limit exceeded. The free version only allows a few requests per minute, or you've used up your free messages for today. Try again later or switch to the paid version."}}\n\n`;
+  }
+  
   res.write(errorPayload);
   res.end();
 }
@@ -1099,14 +1129,18 @@ async function getDefaultModelType(apiKey) {
     });
     
     if (response.data && response.data.data && response.data.data.length > 0) {
+      console.log(`${response.data.data.length} models received from OpenRouter`);
+      
       // Most current models support OFF, so default to that
       return "OFF";
     }
   } catch (err) {
+    console.log("Error getting model info from OpenRouter:", err.message);
     // Continue with default safety mode on error
   }
   
   // Default to OFF for better filter bypassing
+  console.log("Using default safety setting: OFF");
   return "OFF";
 }
 
@@ -1272,7 +1306,7 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
   } catch (error) {
     logResponse(false, error.response?.status || error.message);
     
-    // Pass original error message through
+    // Handle API errors
     if (isStreamingRequested && res.headersSent) {
       sendStreamError(res, error.message || "Unknown error");
     } else if (isStreamingRequested && !res.headersSent) {
@@ -1287,41 +1321,49 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
 
 // "/free" - Free Gemini 2.5 Pro
 app.post('/free', async (req, res) => {
+  console.log(`== NEW REQUEST VIA /free (${new Date().toISOString()}) ==`);
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-exp-03-25:free");
 });
 
 // "/cash" - Paid Gemini 2.5 Pro 
 app.post('/cash', async (req, res) => {
+  console.log(`== NEW REQUEST VIA /cash (${new Date().toISOString()}) ==`);
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25");
 });
 
 // "/jbfree" - Free model with jailbreak
 app.post('/jbfree', async (req, res) => {
+  console.log(`== NEW REQUEST VIA /jbfree (${new Date().toISOString()}) ==`);
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-exp-03-25:free", true);
 });
 
 // "/jbcash" - Paid model with jailbreak
 app.post('/jbcash', async (req, res) => {
+  console.log(`== NEW REQUEST VIA /jbcash (${new Date().toISOString()}) ==`);
   await handleProxyRequestWithModel(req, res, "google/gemini-2.5-pro-preview-03-25", true);
 });
 
 // "/flash25" - Gemini 2.5 Flash Preview with jailbreak
 app.post('/flash25', async (req, res) => {
+  console.log(`== NEW REQUEST VIA /flash25 (${new Date().toISOString()}) ==`);
   await handleProxyRequestWithModel(req, res, GEMINI_25_FLASH_PREVIEW, true);
 });
 
 // "/nofilter" - Model freely selectable, no jailbreak
 app.post('/nofilter', async (req, res) => {
+  console.log(`== NEW REQUEST VIA /nofilter (${new Date().toISOString()}) ==`);
   await handleProxyRequestWithModel(req, res, null, false);
 });
 
 // "/jbnofilter" - Model freely selectable, WITH jailbreak
 app.post('/jbnofilter', async (req, res) => {
+  console.log(`== NEW REQUEST VIA /jbnofilter (${new Date().toISOString()}) ==`);
   await handleProxyRequestWithModel(req, res, null, true);
 });
 
 // Legacy route: "/v1/chat/completions" - Model freely selectable, no jailbreak
 app.post('/v1/chat/completions', async (req, res) => {
+  console.log(`== NEW REQUEST VIA /v1/chat/completions (${new Date().toISOString()}) ==`);
   await handleProxyRequestWithModel(req, res, null, false);
 });
 
@@ -1331,7 +1373,7 @@ app.get('/', (req, res) => {
     status: 'online',
     version: '1.9.0',
     info: 'JanitorAI-OpenRouter Proxy',
-    usage: 'NSFW/Violence support for JanitorAI via OpenRouter',
+    description: 'NSFW/Violence support for JanitorAI via OpenRouter',
     endpoints: {
       model_choice_no_jb: '/nofilter (or /v1/chat/completions)',
       model_choice_with_jb: '/jbnofilter',
@@ -1364,6 +1406,9 @@ app.get('/health', (req, res) => {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Proxy Server v1.9.0 running on port ${PORT}`);
-  console.log(`${new Date().toISOString()} - Server started`);
+  console.log(`=== JanitorAI-OpenRouter Proxy v1.9.0 ===`);
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Started at ${new Date().toISOString()}`);
+  console.log(`Advanced filter bypass techniques enabled`);
+  console.log(`=========================================`);
 });

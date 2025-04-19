@@ -1,4 +1,75 @@
-/*************************************************
+//----------------------------------------------------------
+  // Spezielle Funktion zum Abrufen des Modelltyps von OpenRouter
+  //----------------------------------------------------------
+  async function fetchOpenRouterModelInfo(apiKey, retries = 1) {
+    try {
+      console.log("Abfrage der verfügbaren Modelle von OpenRouter...");
+      const response = await axios.get('https://openrouter.ai/api/v1/models', {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'User-Agent': 'JanitorAI-Proxy/1.8.0'
+        }
+      });
+      
+      if (response.data && response.data.data) {
+        console.log(`${response.data.data.length} Modelle von OpenRouter erhalten`);
+        // Speichern Sie die Modellinformationen im Cache
+        return response.data.data;
+      } else {
+        console.log("Keine Modelldaten von OpenRouter erhalten");
+        return null;
+      }
+    } catch (error) {
+      console.error(`Fehler beim Abrufen der Modellinformationen: ${error.message}`);
+      if (retries > 0) {
+        console.log(`Wiederhole Abfrage (${retries} verbleibend)...`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        return fetchOpenRouterModelInfo(apiKey, retries - 1);
+      }
+      return null;
+    }
+  }
+  
+  // Cache für Modellinformationen
+  let modelInfoCache = null;
+  let modelInfoLastUpdated = 0;
+  
+  async function getDefaultModelType(apiKey) {
+    // Cache für 1 Stunde verwenden
+    const cacheValidFor = 60 * 60 * 1000; // 1 Stunde in Millisekunden
+    const now = Date.now();
+    
+    // Wenn der Cache abgelaufen ist oder keine Daten vorhanden sind
+    if (!modelInfoCache || (now - modelInfoLastUpdated > cacheValidFor)) {
+      modelInfoCache = await fetchOpenRouterModelInfo(apiKey);
+      modelInfoLastUpdated = now;
+    }
+    
+    if (!modelInfoCache) {
+      console.log("Keine Modellinformationen verfügbar, verwende BLOCK_NONE als sicheren Standard");
+      return "BLOCK_NONE";
+    }
+    
+    // Analysiere die Standardmodelle
+    // In der Regel bevorzugt OpenRouter neuere Modelle, die meist OFF unterstützen
+    const defaultModels = modelInfoCache.filter(model => model.default || model.name.includes('gemini'));
+    
+    if (defaultModels.length > 0) {
+      const defaultModel = defaultModels[0].id.toLowerCase();
+      console.log(`Vermutetes Standardmodell: ${defaultModel}`);
+      
+      // Prüfe, ob das Modell OFF unterstützt
+      if (defaultModel.includes('gemini-2.5') || 
+          defaultModel.includes('gemini-2.0')) {
+        console.log("Standardmodell unterstützt vermutlich OFF");
+        return "OFF";
+      }
+    }
+    
+    // Im Zweifel BLOCK_NONE verwenden, das ist sicherer
+    console.log("Verwende BLOCK_NONE für unbekanntes Standardmodell");
+    return "BLOCK_NONE";
+  }/*************************************************
  * server.js - Node/Express + Axios + CORS Proxy für JanitorAI
  * v1.8.0 - Aggressive Filter Bypass Enhancement
  *************************************************/
@@ -165,7 +236,7 @@ function getSafetySettings(modelName) {
     { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'BLOCK_NONE' },
   ];
 
-  const modelConfigs = {
+      const modelConfigs = {
     blockNoneModels: [
       'gemini-1.5-pro-001', 'gemini-1.5-flash-001',
       'gemini-1.5-flash-8b-exp-0827', 'gemini-1.5-flash-8b-exp-0924',
@@ -180,7 +251,7 @@ function getSafetySettings(modelName) {
       'gemini-1.5-pro-latest', 'gemini-1.5-flash-latest'
     ],
     newestModels: [
-      'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-3'
+      'gemini-2.5-flash', 'gemini-2.5-pro'
     ]
   };
 
@@ -859,16 +930,14 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
           ...(clientBody.metadata || {}),
           referer: 'https://janitorai.com/',
           x_title: 'JanitorAI'
-      }
+      },
+      safety_settings: dynamicSafetySettings
     };
     
     // Modell nur setzen, wenn es tatsächlich vorgegeben wurde
     if (modelName) {
       requestBody.model = modelName;
     }
-    
-    // Safety Settings immer hinzufügen - auch wenn kein Modell explizit gesetzt ist
-    requestBody.safety_settings = dynamicSafetySettings;
     
     if (isStreamingRequested) requestBody.stream = true;
     else delete requestBody.stream;

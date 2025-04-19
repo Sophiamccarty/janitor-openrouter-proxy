@@ -862,13 +862,13 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
       }
     };
     
+    // Modell nur setzen, wenn es tatsächlich vorgegeben wurde
     if (modelName) {
       requestBody.model = modelName;
     }
     
-    if (modelName && dynamicSafetySettings.length > 0) {
-      requestBody.safety_settings = dynamicSafetySettings;
-    }
+    // Safety Settings immer hinzufügen - auch wenn kein Modell explizit gesetzt ist
+    requestBody.safety_settings = dynamicSafetySettings;
     
     if (isStreamingRequested) requestBody.stream = true;
     else delete requestBody.stream;

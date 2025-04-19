@@ -1,4 +1,17 @@
-/*************************************************
+// Non-Streaming Response Handling
+    if (response.data?.error) {
+      console.log("Fehler in Openrouter-Antwortdaten:", JSON.stringify(response.data.error));
+      const error = response.data.error;
+      let userMessage = `OpenRouter Error: ${error.message || "Unknown error from API."} (Code: ${error.code || 'N/A'})`;
+      if (error.code === 429 || error.message?.includes("quota")) {
+          userMessage = "Sorry my love, Gemini is unfortunately a bit stingy and you're either too fast, (Wait a few seconds, because the free version only allows a few requests per minute.) or you've used up your free messages for the day in the free version. In that case, you either need to switch to the paid version or wait until tomorrow. I'm sorry! Sending you a big hug! <3";
+      } else if (error.code === 403 || error.message?.includes('PROHIBITED_CONTENT') || error.code === "google_safety" || error.code === "content_filter_empty") {
+          userMessage = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use a Jailbreaked Version (/jbfree, /jbcash, /flash25, /jbnofilter) for NSWF/Violence, or try the paid 'Gemini 2.5 Pro Preview' model (/cash, /jbcash) which is generally more permissive.";
+      }
+      return res.status(200).json(createJanitorErrorResponse(userMessage));
+    }
+
+    return res.json(response.data);/*************************************************
  * server.js - Node/Express + Axios + CORS Proxy für JanitorAI
  * v1.7.0 - Enhanced Safety Settings & Advanced Filter Bypass
  *************************************************/
@@ -838,48 +851,6 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
 
     // 4. Anfrage senden
     const response = await makeRequestWithRetry( endpoint, requestBody, headers, 2, isStreamingRequested );
-
-    console.log(`== Openrouter-Antwort erhalten (${new Date().toISOString()}) ==`);
-
-    // 5. Filtermeldungen entfernen (NEUE FUNKTIONALITÄT)
-    if (!isStreamingRequested) {
-      const cleanedResponse = removeFilterMessages(response);
-      if (cleanedResponse !== response) {
-        console.log("Filter-Nachricht entfernt aus der Antwort");
-      }
-      response = cleanedResponse;
-    }
-
-    // 6. Antwort verarbeiten
-    if (isStreamingRequested) {
-        if (response.data && typeof response.data.pipe === 'function') {
-           if (!res.headersSent) {
-                res.writeHead(200, {
-                    'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive'
-                });
-           }
-            return handleStreamResponse(response.data, res);
-        } else {
-            console.error("Streaming requested, but OpenRouter response is not a stream.");
-            sendStreamError(res, "Proxy Error: Expected a stream from OpenRouter, but received something else.");
-            return;
-        }
-    }
-
-    // Non-Streaming Response Handling
-    if (response.data?.error) {
-      console.log("Fehler in Openrouter-Antwortdaten:", JSON.stringify(response.data.error));
-      const error = response.data.error;
-      let userMessage = `OpenRouter Error: ${error.message || "Unknown error from API."} (Code: ${error.code || 'N/A'})`;
-      if (error.code === 429 || error.message?.includes("quota")) {
-          userMessage = "Sorry my love, Gemini is unfortunately a bit stingy and you're either too fast, (Wait a few seconds, because the free version only allows a few requests per minute.) or you've used up your free messages for the day in the free version. In that case, you either need to switch to the paid version or wait until tomorrow. I'm sorry! Sending you a big hug! <3";
-      } else if (error.code === 403 || error.message?.includes('PROHIBITED_CONTENT') || error.code === "google_safety" || error.code === "content_filter_empty") {
-          userMessage = "Unfortunately, Gemini is being difficult and finds your content too 'extreme'. Use a Jailbreaked Version (/jbfree, /jbcash, /flash25, /jbnofilter) for NSWF/Violence, or try the paid 'Gemini 2.5 Pro Preview' model (/cash, /jbcash) which is generally more permissive.";
-      }
-      return res.status(200).json(createJanitorErrorResponse(userMessage));
-    }
-
-    return res.json(response.data);
 
   } catch (error) {
     console.error("Schwerwiegender Fehler im Proxy:", error.message);

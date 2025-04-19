@@ -171,6 +171,11 @@ const JAILBREAK_TEXT = `## GAME SETTINGS
  * Stark verbessert mit detaillierteren Modellkategorien
  */
 function getSafetySettings(modelName) {
+  if (!modelName) {
+    console.log("Kein Modellname angegeben für Safety Settings - keine Einstellungen angewendet");
+    return [];
+  }
+
   // Umfassende Basis-Safety-Settings für maximale Permissivität
   const safetySettings = [
     { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF' },
@@ -728,55 +733,70 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     // 2. Bypass-Techniken anwenden (NEUE FUNKTIONALITÄT)
     clientBody = processRequestWithBypass(clientBody, 0.9); // 0.9 = sehr aggressiv
 
-    // Debug: Request-Body loggen
-    console.log(`Request-Body für Modellauswahl:`, JSON.stringify({
-      model: clientBody.model,
-      path: req.path,
-      forceModel: forceModel
-    }));
+    // Vollständigen Request-Body für Debugging loggen (ohne große Nachrichten)
+    const requestBodyForLog = {...clientBody};
+    if (requestBodyForLog.messages) {
+      requestBodyForLog.messages = `[${requestBodyForLog.messages.length} messages]`;
+    }
+    console.log(`Vollständiger Request-Body:`, JSON.stringify(requestBodyForLog));
     
-    // Modellname bestimmen: Primär das vom Benutzer angegebene Modell
+    // Modellname bestimmen
     let modelName = forceModel;
+    let modelFromRequest = false;
     
-    // Wenn kein forced model, dann das model aus dem Request-Body verwenden
-    if (!modelName) {
-      // Hier verschiedene mögliche Felder für das Modell prüfen
+    // WICHTIG: Bei /nofilter und /jbnofilter Routen Modell aus dem Request verwenden oder none
+    // Das erlaubt OpenRouter, das vom Benutzer ausgewählte Modell zu verwenden
+    if (!modelName && (req.path === '/nofilter' || req.path === '/jbnofilter' || req.path === '/v1/chat/completions')) {
       if (clientBody.model) {
         modelName = clientBody.model;
+        modelFromRequest = true;
         console.log(`Modell aus Request-Body verwendet: ${modelName}`);
-      } 
-      // Spezieller Fall für OpenRouter API: model könnte auch anders heißen
-      else if (clientBody.models && clientBody.models.length > 0) {
-        modelName = clientBody.models[0];
-        console.log(`Modell aus 'models'-Array verwendet: ${modelName}`);
+      } else {
+        // Bei nofilter-Routen kein Modell erzwingen - OpenRouter wird das vom Benutzer gewählte Modell verwenden
+        modelName = null;
+        console.log(`Keine Modellvorgabe für ${req.path}. OpenRouter wird selbst das passende Modell auswählen.`);
       }
-      // Wenn immer noch kein Modell gefunden, für nofilter-Routen Standardmodell verwenden
-      else if (req.path === '/nofilter' || req.path === '/jbnofilter' || req.path === '/v1/chat/completions') {
-        modelName = "google/gemini-2.5-pro-exp-03-25:free";
-        console.log(`Kein Modell gefunden. Verwende Standard-Modell für ${req.path}: ${modelName}`);
-      }
-      // Für alle anderen Routen einen Fehler werfen
-      else {
-        console.error("Modellname fehlt im Request Body.");
+    }
+    // Bei anderen Routen brauchen wir ein konkretes Modell
+    else if (!modelName) {
+      if (clientBody.model) {
+        modelName = clientBody.model;
+        modelFromRequest = true;
+        console.log(`Modell aus Request-Body verwendet: ${modelName}`);
+      } else {
+        // Für andere als nofilter-Routen muss ein Modell angegeben sein
+        console.error("Modellname fehlt im Request Body für eine Route, die ein Modell benötigt.");
         return res.status(400).json(createJanitorErrorResponse("Model name is missing in the request body."));
       }
     }
     
-    console.log(`Schlussendlich verwendetes Modell: ${modelName}`);
+    console.log(`Schlussendlich verwendetes Modell: ${modelName || "Von OpenRouter bestimmt"}`);
+    
+    // Safety Settings nur holen, wenn ein Modell gesetzt ist
+    const dynamicSafetySettings = modelName ? getSafetySettings(modelName) : [];
 
     const dynamicSafetySettings = getSafetySettings(modelName);
 
     // 3. Request Body vorbereiten
     const requestBody = {
       ...clientBody,
-      model: modelName,
-      safety_settings: dynamicSafetySettings,
       metadata: {
           ...(clientBody.metadata || {}),
-          referer: 'https://janitorai.com/', // Anpassen falls nötig
-          x_title: 'JanitorAI' // Anpassen falls nötig
+          referer: 'https://janitorai.com/',
+          x_title: 'JanitorAI'
       }
     };
+    
+    // Modell nur setzen, wenn es tatsächlich vorgegeben wurde
+    if (modelName) {
+      requestBody.model = modelName;
+    }
+    
+    // Safety Settings nur hinzufügen, wenn ein Modell gesetzt ist
+    if (modelName) {
+      requestBody.safety_settings = dynamicSafetySettings;
+    }
+    
     if (isStreamingRequested) requestBody.stream = true;
     else delete requestBody.stream;
 

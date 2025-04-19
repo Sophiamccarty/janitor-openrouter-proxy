@@ -1207,6 +1207,14 @@ async function fetchOpenRouterModelInfo(apiKey, retries = 1) {
     
     if (response.data && response.data.data) {
       console.log(`${response.data.data.length} Modelle von OpenRouter erhalten`);
+      
+      // Log der ersten 3 Modelle für Debug-Zwecke
+      if (response.data.data.length > 0) {
+        const firstModels = response.data.data.slice(0, 3);
+        console.log("Beispielmodelle:", 
+          firstModels.map(m => `${m.id} (default: ${m.default || false})`).join(', '));
+      }
+      
       return response.data.data;
     } else {
       console.log("Keine Modelldaten von OpenRouter erhalten");
@@ -1237,33 +1245,47 @@ async function getDefaultModelType(apiKey) {
   
   // Wenn der Cache abgelaufen ist oder keine Daten vorhanden sind
   if (!modelInfoCache || (now - modelInfoLastUpdated > cacheValidFor)) {
-    modelInfoCache = await fetchOpenRouterModelInfo(apiKey);
-    modelInfoLastUpdated = now;
-  }
-  
-  if (!modelInfoCache) {
-    console.log("Keine Modellinformationen verfügbar, verwende BLOCK_NONE als sicheren Standard");
-    return "BLOCK_NONE";
-  }
-  
-  // Analysiere die Standardmodelle
-  const defaultModels = modelInfoCache.filter(model => model.default || model.name.includes('gemini'));
-  
-  if (defaultModels.length > 0) {
-    const defaultModel = defaultModels[0].id.toLowerCase();
-    console.log(`Vermutetes Standardmodell: ${defaultModel}`);
-    
-    // Prüfe, ob das Modell OFF unterstützt
-    if (defaultModel.includes('gemini-2.5') || 
-        defaultModel.includes('gemini-2.0')) {
-      console.log("Standardmodell unterstützt vermutlich OFF");
-      return "OFF";
+    try {
+      modelInfoCache = await fetchOpenRouterModelInfo(apiKey);
+      modelInfoLastUpdated = now;
+      
+      if (modelInfoCache) {
+        console.log(`Modellinfo-Cache aktualisiert mit ${modelInfoCache.length} Modellen`);
+      }
+    } catch (err) {
+      console.error("Fehler beim Aktualisieren des Modellinfo-Cache:", err.message);
     }
   }
   
-  // Im Zweifel BLOCK_NONE verwenden, das ist sicherer
-  console.log("Verwende BLOCK_NONE für unbekanntes Standardmodell");
-  return "BLOCK_NONE";
+  // Selbst wenn wir keine Modellinformationen haben, 
+  // verwenden wir standardmäßig "OFF" für bessere Filterumgehung
+  if (!modelInfoCache) {
+    console.log("Keine Modellinformationen verfügbar, verwende OFF als Standard");
+    return "OFF";
+  }
+  
+  // Analysiere die Standardmodelle (mit mehr Logging)
+  try {
+    const defaultModels = modelInfoCache.filter(model => 
+      model.default || model.name?.toLowerCase().includes('gemini')
+    );
+    
+    console.log(`Gefundene Gemini/Default-Modelle: ${defaultModels.length}`);
+    
+    if (defaultModels.length > 0) {
+      const defaultModel = defaultModels[0].id.toLowerCase();
+      console.log(`Erkanntes OpenRouter-Standardmodell: ${defaultModel}`);
+      
+      // Die meisten aktuellen Modelle unterstützen OFF, daher verwenden wir das als Standard
+      return "OFF";
+    }
+  } catch (err) {
+    console.error("Fehler bei der Analyse der Modellinformationen:", err.message);
+  }
+  
+  // Default ist immer OFF für bessere Filterumgehung
+  console.log("Standard-Safety-Settings: OFF");
+  return "OFF";
 }
 
 /**

@@ -1327,25 +1327,54 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     // Preprocess mit Ultra-Bypass für NSFW-Inhalte
     clientBody = processRequestWithBypass(clientBody, 0.98);
 
-    // Logging der Anfrage (ohne große Nachrichteninhalte)
+    // Request-Body in JSON für Debugging
     const requestBodyForLog = {...clientBody};
+    
+    // Vollständiger Request-Body-Dump für Debugging (Modell-Problem)
+    console.log("DEBUG - Vollständiger Request von JanitorAI:", JSON.stringify(requestBodyForLog));
+    
     if (requestBodyForLog.messages) {
       requestBodyForLog.messages = `[${requestBodyForLog.messages.length} messages]`;
     }
-    console.log(`Request-Body:`, JSON.stringify(requestBodyForLog));
+    
+    console.log(`Request-Body (gekürzt):`, JSON.stringify(requestBodyForLog));
     
     // Modellauswahl
     let modelName = forceModel;
     let modelFromRequest = false;
     
-    if (!modelName && (req.path === '/nofilter' || req.path === '/jbnofilter' || req.path === '/v1/chat/completions')) {
+    // Prüfe nach OpenRouter spezifischen Header, der das tatsächlich ausgewählte Modell enthält
+    const userRequestedModel = req.headers['x-openrouter-model'] || req.headers['x-model'];
+    
+    if (userRequestedModel) {
+      modelName = userRequestedModel;
+      modelFromRequest = true;
+      console.log(`Modell aus Header erkannt: ${modelName}`);
+    }
+    // Wenn kein Header, prüfe den Body nach dem Modell
+    else if (!modelName && (req.path === '/nofilter' || req.path === '/jbnofilter' || req.path === '/v1/chat/completions')) {
       if (clientBody.model) {
         modelName = clientBody.model;
         modelFromRequest = true;
-        console.log(`Modell aus Request: ${modelName}`);
+        console.log(`Modell aus Request-Body erkannt: ${modelName}`);
       } else {
-        modelName = null;
-        console.log(`Keine Modellvorgabe für ${req.path}. OpenRouter bestimmt Modell.`);
+        // Weitere mögliche Felder prüfen, wo das Modell stehen könnte
+        const possibleModelFields = ['openrouter_model', 'model_id', 'modelName', 'models'];
+        for (const field of possibleModelFields) {
+          if (clientBody[field]) {
+            const foundModel = Array.isArray(clientBody[field]) ? clientBody[field][0] : clientBody[field];
+            modelName = foundModel;
+            modelFromRequest = true;
+            console.log(`Modell aus alternativen Feld '${field}' erkannt: ${modelName}`);
+            break;
+          }
+        }
+        
+        // Wenn immer noch kein Modell, dann ist es tatsächlich nicht spezifiziert
+        if (!modelName) {
+          modelName = null;
+          console.log(`Keine Modellvorgabe für ${req.path} gefunden. OpenRouter bestimmt Modell.`);
+        }
       }
     }
     else if (!modelName) {

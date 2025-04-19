@@ -728,12 +728,41 @@ async function handleProxyRequestWithModel(req, res, forceModel = null, useJailb
     // 2. Bypass-Techniken anwenden (NEUE FUNKTIONALITÄT)
     clientBody = processRequestWithBypass(clientBody, 0.9); // 0.9 = sehr aggressiv
 
-    const modelName = forceModel || clientBody.model;
+    // Debug: Request-Body loggen
+    console.log(`Request-Body für Modellauswahl:`, JSON.stringify({
+      model: clientBody.model,
+      path: req.path,
+      forceModel: forceModel
+    }));
+    
+    // Modellname bestimmen: Primär das vom Benutzer angegebene Modell
+    let modelName = forceModel;
+    
+    // Wenn kein forced model, dann das model aus dem Request-Body verwenden
     if (!modelName) {
-         console.error("Modellname fehlt im Request Body.");
-         return res.status(400).json(createJanitorErrorResponse("Model name is missing in the request body."));
+      // Hier verschiedene mögliche Felder für das Modell prüfen
+      if (clientBody.model) {
+        modelName = clientBody.model;
+        console.log(`Modell aus Request-Body verwendet: ${modelName}`);
+      } 
+      // Spezieller Fall für OpenRouter API: model könnte auch anders heißen
+      else if (clientBody.models && clientBody.models.length > 0) {
+        modelName = clientBody.models[0];
+        console.log(`Modell aus 'models'-Array verwendet: ${modelName}`);
+      }
+      // Wenn immer noch kein Modell gefunden, für nofilter-Routen Standardmodell verwenden
+      else if (req.path === '/nofilter' || req.path === '/jbnofilter' || req.path === '/v1/chat/completions') {
+        modelName = "google/gemini-2.5-pro-exp-03-25:free";
+        console.log(`Kein Modell gefunden. Verwende Standard-Modell für ${req.path}: ${modelName}`);
+      }
+      // Für alle anderen Routen einen Fehler werfen
+      else {
+        console.error("Modellname fehlt im Request Body.");
+        return res.status(400).json(createJanitorErrorResponse("Model name is missing in the request body."));
+      }
     }
-    console.log(`Verwendetes Modell: ${modelName}`);
+    
+    console.log(`Schlussendlich verwendetes Modell: ${modelName}`);
 
     const dynamicSafetySettings = getSafetySettings(modelName);
 
